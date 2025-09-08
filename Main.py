@@ -812,6 +812,7 @@ Version: 1.1"""
         self.Bind(wx.EVT_MENU, self.search_google_scholar, search_scholar)
         self.Bind(wx.EVT_MENU, lambda e: self.show_full_info(), show_info)
 
+
         # Show menu
         self.PopupMenu(menu)
         menu.Destroy()
