@@ -11,6 +11,14 @@ import pyperclip
 import matplotlib
 import wx.adv
 
+# Force pyarrow import before pandas
+try:
+    import pyarrow
+    import pyarrow.parquet
+    print(f"Pyarrow version: {pyarrow.__version__}")
+except ImportError as e:
+    print(f"Pyarrow import error: {e}")
+
 matplotlib.use('WXAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigureCanvas
@@ -49,6 +57,10 @@ class PeriodicTableXPS(wx.Frame):
 
         # Load data
         self.load_data()
+
+        # Check if data loading was successful
+        if not hasattr(self, 'elements') or not hasattr(self, 'df'):
+            return  # Exit early if data loading failed
 
         # Create main panel
         self.panel = wx.Panel(self)
@@ -139,8 +151,8 @@ Version: 1.1"""
 
         possible_paths = [
             os.path.join(base_path, "NIST_BE.parquet"),
-            # os.path.join(base_path, "libraries", "NIST_BE.parquet"),
-            # os.path.join(base_path, "..", "Resources", "NIST_BE.parquet"),  # Mac app bundle
+            os.path.join(base_path, "libraries", "NIST_BE.parquet"),
+            os.path.join(base_path, "..", "Resources", "NIST_BE.parquet"),  # Mac app bundle
             # os.path.join(base_path, "NIST_BE.xlsx"),
             # os.path.join(base_path, "libraries", "NIST_BE.xlsx"),
             # os.path.join(base_path, "..", "Resources", "NIST_BE.xlsx")  # Mac app bundle
@@ -165,58 +177,135 @@ Version: 1.1"""
                     continue
 
         if not data_found:
-            wx.MessageBox("Failed to load data: NIST_BE file not found",
-                          "Error", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox(
+                f"Failed to load data: NIST_BE.parquet file not found.\n\n"
+                f"Searched at: {data_path}\n"
+                f"Base path: {base_path}\n"
+                f"Frozen: {getattr(sys, 'frozen', False)}",
+                "Error", wx.OK | wx.ICON_ERROR
+            )
             self.Close()
 
-    def load_data(self):
+    def load_data_WORK(self):
         """Load XPS data from file"""
-        # Initialize with empty lists as fallback
-        self.elements = []
-        self.lines = []
+        import os
 
+        parquet_file = 'NIST_BE.parquet'
+
+        # Check current directory first
+        if os.path.exists(parquet_file):
+            try:
+                # Try importing pyarrow explicitly
+                import pyarrow
+                import pyarrow.parquet
+                print(f"Pyarrow available: {pyarrow.__version__}")
+            except ImportError:
+                print("Pyarrow not available, trying to read parquet anyway...")
+
+            try:
+                self.df = pd.read_parquet(parquet_file)
+                print('Successfully loaded NIST library from current directory')
+
+                self.elements = sorted(self.df['Element'].unique())
+                self.lines = sorted(self.df['Line'].unique())
+                return
+            except Exception as e:
+                print(f'Failed to load from current directory: {e}')
+                # If parquet fails, try to convert and use pickle as fallback
+                try:
+                    print("Attempting to use pickle fallback...")
+                    pickle_file = parquet_file.replace('.parquet', '.pkl')
+                    if os.path.exists(pickle_file):
+                        self.df = pd.read_pickle(pickle_file)
+                        self.elements = sorted(self.df['Element'].unique())
+                        self.lines = sorted(self.df['Line'].unique())
+                        print('Loaded from pickle fallback')
+                        return
+                except:
+                    pass
+
+        # If not found in current directory, try the PyInstaller path
         if getattr(sys, 'frozen', False):
-            base_path = os.path.dirname(sys.executable)
-        else:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            base_path = current_dir  # Changed this line - use current_dir instead of parent
+            base_path = sys._MEIPASS
+            data_path = os.path.join(base_path, parquet_file)
+            print(f"Trying PyInstaller path: {data_path}")
 
-        possible_paths = [
-            os.path.join(base_path, "NIST_BE.parquet"),
-            os.path.join(base_path, "libraries", "NIST_BE.parquet"),
-            os.path.join(base_path, "..", "Resources", "NIST_BE.parquet"),  # Mac app bundle
-            os.path.join(base_path, "NIST_BE.xlsx"),
-            os.path.join(base_path, "libraries", "NIST_BE.xlsx"),
-            os.path.join(base_path, "..", "Resources", "NIST_BE.xlsx")  # Mac app bundle
-        ]
-
-        data_found = False
-        for data_path in possible_paths:
-            print(f"Trying path: {data_path}")  # Debug print
             if os.path.exists(data_path):
                 try:
-                    if data_path.endswith('.parquet'):
-                        self.df = pd.read_parquet(data_path)
-                        print(f'Loaded the .parquet NIST library from {data_path}')
-                    else:
-                        self.df = pd.read_excel(data_path)
-                        print(f'Loaded the .xlsx NIST library from {data_path}')
+                    self.df = pd.read_parquet(data_path)
+                    print('Successfully loaded NIST library from PyInstaller path')
 
                     self.elements = sorted(self.df['Element'].unique())
                     self.lines = sorted(self.df['Line'].unique())
-                    data_found = True
-                    break
+                    return
                 except Exception as e:
-                    print(f"Failed to load {data_path}: {e}")  # Debug print
-                    continue
+                    print(f'Failed to load from PyInstaller path: {e}')
 
-        if not data_found:
-            print(f"Current working directory: {os.getcwd()}")  # Debug print
-            print(f"Base path: {base_path}")  # Debug print
-            wx.MessageBox("Failed to load data: NIST_BE file not found",
-                          "Error", wx.OK | wx.ICON_ERROR)
-            # Don't close immediately - let the app start with empty data
-            # self.Close()
+        # If still not found, try script directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        data_path = os.path.join(script_dir, parquet_file)
+        print(f"Trying script directory: {data_path}")
+
+        if os.path.exists(data_path):
+            try:
+                self.df = pd.read_parquet(data_path)
+                print('Successfully loaded NIST library from script directory')
+
+                self.elements = sorted(self.df['Element'].unique())
+                self.lines = sorted(self.df['Line'].unique())
+                return
+            except Exception as e:
+                print(f'Failed to load from script directory: {e}')
+
+        # Debug information
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Script directory: {script_dir}")
+        if getattr(sys, 'frozen', False):
+            print(f"PyInstaller temp directory: {sys._MEIPASS}")
+            try:
+                print(f"Files in PyInstaller temp: {os.listdir(sys._MEIPASS)}")
+            except:
+                print("Could not list PyInstaller temp directory")
+
+        # Show error
+        wx.MessageBox(
+            f"Failed to load data: {parquet_file} file not found.\n\n"
+            f"Searched in:\n"
+            f"- Current directory: {os.getcwd()}\n"
+            f"- Script directory: {script_dir}\n" +
+            (f"- PyInstaller temp: {sys._MEIPASS}\n" if getattr(sys, 'frozen', False) else ""),
+            "Error", wx.OK | wx.ICON_ERROR
+        )
+        self.Close()
+
+    def load_data(self):
+        """Load XPS data from file"""
+        data_file = 'NIST_BE.parquet'
+
+        # For PyInstaller, check the temporary directory first
+        if getattr(sys, 'frozen', False):
+            # Running as executable - data is in PyInstaller's temp directory
+            data_path = os.path.join(sys._MEIPASS, data_file)
+        else:
+            # Running as script - data is in current directory
+            data_path = data_file
+
+        try:
+            self.df = pd.read_parquet(data_path)
+            self.elements = sorted(self.df['Element'].unique())
+            self.lines = sorted(self.df['Line'].unique())
+            print(f'Successfully loaded NIST library from: {data_path}')
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to load NIST_BE.parquet\n\n"
+                f"Error: {str(e)}\n"
+                f"Searched at: {data_path}\n"
+                f"File exists: {os.path.exists(data_path)}"
+            )
+            print(error_msg)
+            wx.MessageBox(error_msg, "Error", wx.OK | wx.ICON_ERROR)
+            self.Close()
 
     def create_periodic_table(self):
         """Create the periodic table with colored buttons"""
