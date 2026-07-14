@@ -12,6 +12,9 @@ build/
 dist/
 *.exe
 
+# Distribution archives / installers
+*.zip
+
 # IDE
 .idea/
 
