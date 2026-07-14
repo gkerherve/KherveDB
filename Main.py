@@ -7,17 +7,10 @@ import re
 from typing import Dict, List, Tuple
 import os
 import sys
+import json
 import pyperclip
 import matplotlib
 import wx.adv
-
-# Force pyarrow import before pandas
-try:
-    import pyarrow
-    import pyarrow.parquet
-    print(f"Pyarrow version: {pyarrow.__version__}")
-except ImportError as e:
-    print(f"Pyarrow import error: {e}")
 
 matplotlib.use('WXAgg')
 from matplotlib.figure import Figure
@@ -28,10 +21,32 @@ import platform
 import wx.html2
 
 
+# Standalone icon helper (replaces libraries.Utilities.set_app_icon)
+if getattr(sys, 'frozen', False):
+    _ICON_PATH = os.path.join(os.path.dirname(sys.executable), "Icons", "Icon.ico")
+else:
+    _ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Icons", "Icon.ico")
+
+
+def set_app_icon(frame):
+    """Set the KherveDB application icon on any wx.Frame."""
+    if os.path.exists(_ICON_PATH):
+        try:
+            frame.SetIcon(wx.Icon(_ICON_PATH, wx.BITMAP_TYPE_ICO))
+        except Exception:
+            pass
+
+
 class PeriodicTableXPS(wx.Frame):
-    def __init__(self):
+    def __init__(self, parent=None):  # MUST have parent=None parameter
         super().__init__(None, title="KherveDB Library: How I wish NIST would look like",
                          size=(690, 720))
+        set_app_icon(self)
+
+        self.parent = parent
+
+        # Load persistent configuration
+        self.config = self.load_config()
 
         if platform.system() == 'Darwin':  # Mac OS
             window_size = (680, 720)
@@ -44,13 +59,18 @@ class PeriodicTableXPS(wx.Frame):
             self.SetMinSize((785, 760))
             self.SetMaxSize((785, 760))
         else:
-            window_size = (705, 720)
+            window_size = (710, 720)
             # Set minimum and maximum sizes
-            self.SetMinSize((705, 660))
-            self.SetMaxSize((705, 10000))
+            self.SetMinSize((710, 660))
+            self.SetMaxSize((710, 10000))
 
-        # Center the window
-        self.Centre()
+
+
+        # # Center the window
+        # self.Centre()
+
+        # # Position window on left side of screen
+        # self.position_on_left()
 
         # Create menu bar
         self.create_menu()
@@ -58,12 +78,8 @@ class PeriodicTableXPS(wx.Frame):
         # Load data
         self.load_data()
 
-        # Check if data loading was successful
-        if not hasattr(self, 'elements') or not hasattr(self, 'df'):
-            return  # Exit early if data loading failed
-
         # Create main panel
-        self.panel = wx.Panel(self)
+        self.panel = wx.Panel(self, style=wx.BORDER_SUNKEN)
         self.main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Create UI components
@@ -85,15 +101,73 @@ class PeriodicTableXPS(wx.Frame):
         # Track property dialog
         self.property_dialog = None
         self.property_dialog_position = None
-        self.property_dialog_size = None  # Add this line
         self.property_dialog_tab_index = 0  # Remember which tab was selected
 
         # Bind close event
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
+        # Default to Carbon 1s
+        wx.CallAfter(self.select_element, 'C')
+        wx.CallAfter(self.set_line_selection, '1s')
+        # Apply simplified mode from config on startup
+        if self.config.get('simplified_periodic_table', False):
+            wx.CallAfter(self.refresh_periodic_table)
+
     def on_close(self, event):
         """Handle window close event"""
+        # Save property dialog position if it exists
+        if self.property_dialog and self.property_dialog.IsShown():
+            self.property_dialog_position = self.property_dialog.GetPosition()
+            try:
+                self.property_dialog_tab_index = self.property_dialog.notebook.GetSelection()
+            except:
+                pass
         self.Destroy()
+
+    def position_on_left(self):
+        """Position window on the left side of the screen where KherveFitting is"""
+        try:
+            if self.parent and self.parent.IsShown():
+                # Get the display where parent is located
+                parent_pos = self.parent.GetPosition()
+                parent_size = self.parent.GetSize()
+
+                # Find which display contains the parent
+                num_displays = wx.Display.GetCount()
+                target_display = None
+
+                for i in range(num_displays):
+                    display = wx.Display(i)
+                    geometry = display.GetGeometry()
+
+                    # Check if parent window is on this display
+                    if (geometry.Contains(parent_pos) or
+                            geometry.Contains(wx.Point(parent_pos.x + parent_size.width // 2,
+                                                       parent_pos.y + parent_size.height // 2))):
+                        target_display = display
+                        break
+
+                if not target_display:
+                    target_display = wx.Display(0)
+
+                geometry = target_display.GetGeometry()
+            else:
+                # Use primary display if no parent
+                target_display = wx.Display(0)
+                geometry = target_display.GetGeometry()
+
+            # Position on left side of the display
+            x = geometry.GetLeft() + 20
+            y = geometry.GetTop() + 50
+
+            self.SetPosition((x, y))
+
+        except Exception as e:
+            print(f"Error positioning window: {e}")
+            # Fallback to default screen left side
+            display = wx.Display(0)
+            geometry = display.GetGeometry()
+            self.SetPosition((geometry.GetLeft() + 20, geometry.GetTop() + 50))
 
     def detect_mac_os(self):
         """Detect if running on macOS"""
@@ -105,9 +179,29 @@ class PeriodicTableXPS(wx.Frame):
 
         # File menu
         file_menu = wx.Menu()
+        export_item = file_menu.Append(wx.ID_ANY, '&Export Filtered Data...\tCtrl+E',
+                                       'Export currently filtered NIST data to a text file')
+        self.Bind(wx.EVT_MENU, self.export_filtered_data, export_item)
+        file_menu.AppendSeparator()
         exit_item = file_menu.Append(wx.ID_EXIT, 'E&xit\tCtrl+Q', 'Exit application')
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), exit_item)
         menubar.Append(file_menu, '&File')
+
+        # View menu
+        view_menu = wx.Menu()
+        databases_item = view_menu.Append(wx.ID_ANY, '&Other Databases && Properties',
+                                          'Open Other Databases & Properties panel')
+        self.Bind(wx.EVT_MENU, self.show_element_properties, databases_item)
+        view_menu.AppendSeparator()
+        self.simple_pt_item = view_menu.AppendCheckItem(wx.ID_ANY, '&Simplified Periodic Table',
+                                                        'Show element tiles without colours or extra info')
+        self.simple_pt_item.Check(self.config.get('simplified_periodic_table', False))
+        self.Bind(wx.EVT_MENU, self.on_toggle_simple_pt, self.simple_pt_item)
+        view_menu.AppendSeparator()
+        scholar_delay_item = view_menu.Append(wx.ID_ANY, '&Scholar Tab Load Delay...',
+                                              'Set how many seconds before Scholar tabs auto-load')
+        self.Bind(wx.EVT_MENU, self.on_set_scholar_delay, scholar_delay_item)
+        menubar.Append(view_menu, '&View')
 
         # Help menu
         help_menu = wx.Menu()
@@ -116,6 +210,74 @@ class PeriodicTableXPS(wx.Frame):
         menubar.Append(help_menu, '&Help')
 
         self.SetMenuBar(menubar)
+
+    def export_filtered_data(self, event):
+        """Export currently filtered NIST data to a tab-delimited text file"""
+        filtered_df = self.get_filtered_data()
+        if filtered_df.empty:
+            wx.MessageBox("No data to export (current filter returns 0 rows).",
+                          "Export", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        # Suggest a filename based on current element / line selection
+        element_part = self.selected_element if self.selected_element else "all"
+        line_sel = self.line_combo.GetStringSelection()
+        line_part = line_sel.replace("/", "-") if line_sel != "All Lines" else "all_lines"
+        default_name = f"NIST_XPS_{element_part}_{line_part}.txt"
+
+        with wx.FileDialog(
+            self, "Export filtered data",
+            defaultFile=default_name,
+            wildcard="Text files (*.txt)|*.txt|CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT
+        ) as dlg:
+            if dlg.ShowModal() == wx.ID_CANCEL:
+                return
+            path = dlg.GetPath()
+
+        try:
+            sep = "," if path.lower().endswith(".csv") else "\t"
+            filtered_df.to_csv(path, index=False, sep=sep, encoding='utf-8')
+            self.status_text.SetLabel(f"Exported {len(filtered_df)} rows to {os.path.basename(path)}")
+        except Exception as e:
+            wx.MessageBox(f"Export failed:\n{e}", "Export Error", wx.OK | wx.ICON_ERROR)
+
+    def on_toggle_simple_pt(self, event):
+        """Toggle simplified periodic table view and save to config"""
+        simplified = self.simple_pt_item.IsChecked()
+        self.config['simplified_periodic_table'] = simplified
+        self.save_config()
+        self.refresh_periodic_table()
+
+    def on_set_scholar_delay(self, event):
+        """Let the user choose how many seconds before Scholar tabs auto-load"""
+        current = self.config.get('scholar_load_delay_seconds', 0)
+        dlg = wx.NumberEntryDialog(
+            self,
+            message="Enter the delay in seconds before Scholar tabs automatically\n"
+                    "load Google Scholar after opening the dialog.\n\n"
+                    "Set to 0 to load immediately (original behaviour).",
+            prompt="Delay (seconds):",
+            caption="Scholar Tab Load Delay",
+            value=current,
+            min=0,
+            max=3600
+        )
+        if dlg.ShowModal() == wx.ID_OK:
+            self.config['scholar_load_delay_seconds'] = dlg.GetValue()
+            self.save_config()
+            self.status_text.SetLabel(
+                f"Scholar tab load delay set to {dlg.GetValue()} second(s). "
+                f"Takes effect next time the dialog is opened."
+            )
+        dlg.Destroy()
+
+    def refresh_periodic_table(self):
+        """Redraw all element tiles to reflect the current simplified/full mode"""
+        simplified = self.config.get('simplified_periodic_table', False)
+        for element, btn in self.element_buttons.items():
+            btn.simplified = simplified
+            btn.Refresh()
 
     def show_about(self, event):
         """Display information about the application"""
@@ -136,26 +298,53 @@ This application also provide rapid access to the website XPSfitting from M. Bie
 the webite of Thermo Knowledge.
 
 Developer: Gwilherm Kerherve
-Version: 1.1"""
+Version: 4.0"""
 
         wx.MessageBox(about_text, "About My KherveDB Library",
                       wx.OK | wx.ICON_INFORMATION)
 
-    def load_data_OLD(self):
+    def load_config(self):
+        """Load configuration from config.json next to the script"""
+        try:
+            if getattr(sys, 'frozen', False):
+                base_path = os.path.dirname(sys.executable)
+            else:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            config_path = os.path.join(base_path, 'config.json')
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def save_config(self):
+        """Save configuration to config.json next to the script"""
+        try:
+            if getattr(sys, 'frozen', False):
+                base_path = os.path.dirname(sys.executable)
+            else:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            config_path = os.path.join(base_path, 'config.json')
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            print(f"Could not save config: {e}")
+
+    def load_data(self):
         """Load XPS data from file"""
         if getattr(sys, 'frozen', False):
             base_path = os.path.dirname(sys.executable)
         else:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            base_path = os.path.dirname(current_dir)
+            base_path = os.path.dirname(os.path.abspath(__file__))
 
         possible_paths = [
             os.path.join(base_path, "NIST_BE.parquet"),
             os.path.join(base_path, "libraries", "NIST_BE.parquet"),
             os.path.join(base_path, "..", "Resources", "NIST_BE.parquet"),  # Mac app bundle
-            # os.path.join(base_path, "NIST_BE.xlsx"),
-            # os.path.join(base_path, "libraries", "NIST_BE.xlsx"),
-            # os.path.join(base_path, "..", "Resources", "NIST_BE.xlsx")  # Mac app bundle
+            os.path.join(base_path, "NIST_BE.xlsx"),
+            os.path.join(base_path, "libraries", "NIST_BE.xlsx"),
+            os.path.join(base_path, "..", "Resources", "NIST_BE.xlsx")  # Mac app bundle
         ]
 
         data_found = False
@@ -177,141 +366,24 @@ Version: 1.1"""
                     continue
 
         if not data_found:
-            wx.MessageBox(
-                f"Failed to load data: NIST_BE.parquet file not found.\n\n"
-                f"Searched at: {data_path}\n"
-                f"Base path: {base_path}\n"
-                f"Frozen: {getattr(sys, 'frozen', False)}",
-                "Error", wx.OK | wx.ICON_ERROR
-            )
-            self.Close()
-
-    def load_data_WORK(self):
-        """Load XPS data from file"""
-        import os
-
-        parquet_file = 'NIST_BE.parquet'
-
-        # Check current directory first
-        if os.path.exists(parquet_file):
-            try:
-                # Try importing pyarrow explicitly
-                import pyarrow
-                import pyarrow.parquet
-                print(f"Pyarrow available: {pyarrow.__version__}")
-            except ImportError:
-                print("Pyarrow not available, trying to read parquet anyway...")
-
-            try:
-                self.df = pd.read_parquet(parquet_file)
-                print('Successfully loaded NIST library from current directory')
-
-                self.elements = sorted(self.df['Element'].unique())
-                self.lines = sorted(self.df['Line'].unique())
-                return
-            except Exception as e:
-                print(f'Failed to load from current directory: {e}')
-                # If parquet fails, try to convert and use pickle as fallback
-                try:
-                    print("Attempting to use pickle fallback...")
-                    pickle_file = parquet_file.replace('.parquet', '.pkl')
-                    if os.path.exists(pickle_file):
-                        self.df = pd.read_pickle(pickle_file)
-                        self.elements = sorted(self.df['Element'].unique())
-                        self.lines = sorted(self.df['Line'].unique())
-                        print('Loaded from pickle fallback')
-                        return
-                except:
-                    pass
-
-        # If not found in current directory, try the PyInstaller path
-        if getattr(sys, 'frozen', False):
-            base_path = sys._MEIPASS
-            data_path = os.path.join(base_path, parquet_file)
-            print(f"Trying PyInstaller path: {data_path}")
-
-            if os.path.exists(data_path):
-                try:
-                    self.df = pd.read_parquet(data_path)
-                    print('Successfully loaded NIST library from PyInstaller path')
-
-                    self.elements = sorted(self.df['Element'].unique())
-                    self.lines = sorted(self.df['Line'].unique())
-                    return
-                except Exception as e:
-                    print(f'Failed to load from PyInstaller path: {e}')
-
-        # If still not found, try script directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_path = os.path.join(script_dir, parquet_file)
-        print(f"Trying script directory: {data_path}")
-
-        if os.path.exists(data_path):
-            try:
-                self.df = pd.read_parquet(data_path)
-                print('Successfully loaded NIST library from script directory')
-
-                self.elements = sorted(self.df['Element'].unique())
-                self.lines = sorted(self.df['Line'].unique())
-                return
-            except Exception as e:
-                print(f'Failed to load from script directory: {e}')
-
-        # Debug information
-        print(f"Current working directory: {os.getcwd()}")
-        print(f"Script directory: {script_dir}")
-        if getattr(sys, 'frozen', False):
-            print(f"PyInstaller temp directory: {sys._MEIPASS}")
-            try:
-                print(f"Files in PyInstaller temp: {os.listdir(sys._MEIPASS)}")
-            except:
-                print("Could not list PyInstaller temp directory")
-
-        # Show error
-        wx.MessageBox(
-            f"Failed to load data: {parquet_file} file not found.\n\n"
-            f"Searched in:\n"
-            f"- Current directory: {os.getcwd()}\n"
-            f"- Script directory: {script_dir}\n" +
-            (f"- PyInstaller temp: {sys._MEIPASS}\n" if getattr(sys, 'frozen', False) else ""),
-            "Error", wx.OK | wx.ICON_ERROR
-        )
-        self.Close()
-
-    def load_data(self):
-        """Load XPS data from file"""
-        data_file = 'NIST_BE.parquet'
-
-        # For PyInstaller, check the temporary directory first
-        if getattr(sys, 'frozen', False):
-            # Running as executable - data is in PyInstaller's temp directory
-            data_path = os.path.join(sys._MEIPASS, data_file)
-        else:
-            # Running as script - data is in current directory
-            data_path = data_file
-
-        try:
-            self.df = pd.read_parquet(data_path)
-            self.elements = sorted(self.df['Element'].unique())
-            self.lines = sorted(self.df['Line'].unique())
-            print(f'Successfully loaded NIST library from: {data_path}')
-
-        except Exception as e:
-            error_msg = (
-                f"Failed to load NIST_BE.parquet\n\n"
-                f"Error: {str(e)}\n"
-                f"Searched at: {data_path}\n"
-                f"File exists: {os.path.exists(data_path)}"
-            )
-            print(error_msg)
-            wx.MessageBox(error_msg, "Error", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox("Failed to load data: NIST_BE file not found",
+                          "Error", wx.OK | wx.ICON_ERROR)
             self.Close()
 
     def create_periodic_table(self):
         """Create the periodic table with colored buttons"""
         # Create frame for periodic table
-        pt_panel = wx.Panel(self.panel, style=wx.BORDER_SUNKEN)
-        pt_panel.SetBackgroundColour(wx.Colour(230, 230, 230))
+        pt_panel = wx.Panel(self.panel, style=wx.BORDER_RAISED)
+
+        # Handle macOS dark mode
+        import platform
+        is_macos_dark = platform.system() == 'Darwin' and wx.SystemSettings.GetAppearance().IsDark()
+
+        if is_macos_dark:
+            pt_panel.SetBackgroundColour(wx.Colour(40, 40, 40))
+        else:
+            # pt_panel.SetBackgroundColour(wx.Colour(230, 230, 230))
+            pt_panel.SetBackgroundColour(wx.WHITE)
 
         # Use grid sizer for periodic table layout
         if 'wxGTK' in wx.PlatformInfo: # Spacing Linux
@@ -599,8 +671,18 @@ Version: 1.1"""
 
     def create_search_area(self):
         """Create the search interface"""
-        search_panel = wx.Panel(self.panel, style=wx.BORDER_SUNKEN)
-        search_panel.SetBackgroundColour(wx.Colour(224, 224, 224))
+        search_panel = wx.Panel(self.panel, style=wx.BORDER_RAISED)
+
+        # Handle macOS dark mode
+        import platform
+        is_macos_dark = platform.system() == 'Darwin' and wx.SystemSettings.GetAppearance().IsDark()
+
+        if is_macos_dark:
+            search_panel.SetBackgroundColour(wx.Colour(45, 45, 45))
+            element_label_bg = wx.Colour(45, 45, 45)
+        else:
+            search_panel.SetBackgroundColour(wx.Colour(224, 224, 224))
+            element_label_bg = wx.WHITE
 
         search_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
@@ -611,7 +693,7 @@ Version: 1.1"""
         left_sizer.Add(wx.StaticText(search_panel, label="Selected Element:"),
                        pos=(0, 0), flag=wx.ALIGN_CENTER_VERTICAL)
         self.element_label = wx.StaticText(search_panel, label="None",
-                                           style=wx.BORDER_SUNKEN | wx.ST_NO_AUTORESIZE)
+                                           style=wx.BORDER_RAISED | wx.ST_NO_AUTORESIZE)
         self.element_label.SetBackgroundColour(wx.WHITE)
         self.element_label.SetMinSize((60, -1))
         left_sizer.Add(self.element_label, pos=(0, 1), flag=wx.EXPAND)
@@ -643,7 +725,7 @@ Version: 1.1"""
         right_sizer.Add(self.name_search, pos=(1, 1), flag=wx.EXPAND)
 
         # Buttons
-        self.properties_btn = wx.Button(search_panel, label="Properties")
+        self.properties_btn = wx.Button(search_panel, label="Other Databases && Properties")
         self.properties_btn.Bind(wx.EVT_BUTTON, self.show_element_properties)
         right_sizer.Add(self.properties_btn, pos=(0, 2))
 
@@ -656,13 +738,13 @@ Version: 1.1"""
         search_sizer.Add(right_sizer, 1, wx.ALL | wx.EXPAND, 10)
 
         search_panel.SetSizer(search_sizer)
-        self.main_sizer.Add(search_panel, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 1)
+        self.main_sizer.Add(search_panel, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 0)
 
 
     def create_results_table(self):
         """Create the results table"""
         # Create panel for results
-        results_panel = wx.Panel(self.panel)
+        results_panel = wx.Panel(self.panel, style = wx.BORDER_RAISED)
         results_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Create grid
@@ -689,9 +771,9 @@ Version: 1.1"""
         # Platform-specific column widths
         import platform
         if platform.system() == 'Darwin':  # macOS
-            col_widths = [25, 50, 60, 100, 200, 225]
+            col_widths = [25, 50, 60, 100, 200, 228]
         else:  # Windows and other systems
-            col_widths = [25, 50, 60, 110, 190, 225]  # Slightly wider for Windows
+            col_widths = [25, 50, 60, 110, 190, 228]  # Slightly wider for Windows
 
         for i, (label, width) in enumerate(zip(col_labels, col_widths)):
             self.results_grid.SetColLabelValue(i, label)
@@ -709,22 +791,21 @@ Version: 1.1"""
         self.status_text = wx.StaticText(results_panel, label="Ready")
 
         # Add to sizer
-        results_sizer.Add(self.results_grid, 1, wx.ALL | wx.EXPAND, 5)
-        results_sizer.Add(self.status_text, 0, wx.ALL | wx.EXPAND, 5)
+        results_sizer.Add(self.results_grid, 1, wx.ALL | wx.EXPAND, 0)
+        results_sizer.Add(self.status_text, 0, wx.ALL | wx.EXPAND, 0)
 
         results_panel.SetSizer(results_sizer)
-        self.main_sizer.Add(results_panel, 1, wx.ALL | wx.EXPAND, 1)
+        self.main_sizer.Add(results_panel, 1, wx.ALL | wx.EXPAND, 0)
 
         # Sort tracking
         self.sort_column = None
         self.sort_ascending = True
 
-    def select_element(self, element):
+    def select_element_OLD(self, element):
         """Handle element selection"""
-        # Close existing property dialog if open and remember position, size and tab
+        # Close existing property dialog if open and remember position and tab
         if self.property_dialog:
             self.property_dialog_position = self.property_dialog.GetPosition()
-            self.property_dialog_size = self.property_dialog.GetSize()  # Add this line
             # Remember the selected tab
             try:
                 self.property_dialog_tab_index = self.property_dialog.notebook.GetSelection()
@@ -745,16 +826,36 @@ Version: 1.1"""
 
         self.update_results()
 
-        # Auto-open properties dialog for new element at same position with same tab and size
+        # Auto-open properties dialog for new element at same position with same tab
         if self.property_dialog_position:  # Only if a dialog was previously open
             self.show_element_properties(None)
+
+    def select_element(self, element):
+        """Handle element selection"""
+        self.selected_element = element
+        self.element_label.SetLabel(element)
+
+        # Update line dropdown
+        element_lines = ['All Lines'] + sorted(
+            self.df[self.df['Element'] == element]['Line'].unique().tolist()
+        )
+        self.line_combo.Set(element_lines)
+        self.line_combo.SetSelection(0)
+
+        self.update_results()
+
+        # Update existing property dialog if it's open
+        if self.property_dialog and self.property_dialog.IsShown():
+            self.property_dialog.update_element(element)
+            self.property_dialog.Raise()
 
     def on_element_double_click(self, element):
         """Handle double-click on element"""
         if element in self.elements:
             self.select_element(element)
-            # Always show properties on double-click, even if no previous dialog
-            self.show_element_properties(None)
+            # Show properties on double-click
+            if not self.property_dialog or not self.property_dialog.IsShown():
+                self.show_element_properties(None)
 
     def on_line_selected(self, event):
         """Handle line selection"""
@@ -766,34 +867,31 @@ Version: 1.1"""
 
     def get_filtered_data(self):
         """Get filtered dataframe based on current selections"""
-        filtered_df = self.df.copy()
+        # Build a boolean mask without copying the full DataFrame
+        mask = pd.Series([True] * len(self.df), index=self.df.index)
 
         # Filter by element
         if self.selected_element:
-            filtered_df = filtered_df[filtered_df['Element'] == self.selected_element]
+            mask &= self.df['Element'] == self.selected_element
 
         # Filter by line
         selected_line = self.line_combo.GetStringSelection()
         if selected_line != 'All Lines':
-            filtered_df = filtered_df[filtered_df['Line'] == selected_line]
+            mask &= self.df['Line'] == selected_line
 
         # Filter by formula
         formula_search = self.formula_search.GetValue().strip().lower()
         if formula_search:
             formula_search = re.escape(formula_search)
-            filtered_df = filtered_df[
-                filtered_df['Formula'].str.lower().str.contains(formula_search, na=False)
-            ]
+            mask &= self.df['Formula'].str.lower().str.contains(formula_search, na=False)
 
         # Filter by name
         name_search = self.name_search.GetValue().strip().lower()
         if name_search:
             name_search = re.escape(name_search)
-            filtered_df = filtered_df[
-                filtered_df['Name'].str.lower().str.contains(name_search, na=False)
-            ]
+            mask &= self.df['Name'].str.lower().str.contains(name_search, na=False)
 
-        return filtered_df
+        return self.df[mask]
 
     def update_results(self):
         """Update the results grid"""
@@ -827,28 +925,34 @@ Version: 1.1"""
         else:
             filtered_df = filtered_df.sort_values(by='BE (eV)')
 
+        # Suspend redraws while updating grid (major speed improvement)
+        self.results_grid.BeginBatch()
+
         # Clear existing rows
         if self.results_grid.GetNumberRows() > 0:
             self.results_grid.DeleteRows(0, self.results_grid.GetNumberRows())
 
-        # Add new rows
-        for _, row in filtered_df.iterrows():
-            self.results_grid.AppendRows(1)
-            row_num = self.results_grid.GetNumberRows() - 1
+        # Add all rows in one call, then fill values
+        num_rows = len(filtered_df)
+        if num_rows > 0:
+            self.results_grid.AppendRows(num_rows)
+            for i, (_, row) in enumerate(filtered_df.iterrows()):
+                self.results_grid.SetCellValue(i, 0, str(row['Element']))
+                self.results_grid.SetCellValue(i, 1, str(row['Line']))
+                self.results_grid.SetCellValue(i, 2,
+                                               f"{row['BE (eV)']:.2f}" if pd.notnull(row['BE (eV)']) else "")
+                self.results_grid.SetCellValue(i, 3,
+                                               str(row['Formula']) if pd.notnull(row['Formula']) else "")
+                self.results_grid.SetCellValue(i, 4,
+                                               str(row['Name']) if pd.notnull(row['Name']) else "")
+                self.results_grid.SetCellValue(i, 5,
+                                               str(row['Journal']) if pd.notnull(row['Journal']) else "")
 
-            self.results_grid.SetCellValue(row_num, 0, str(row['Element']))
-            self.results_grid.SetCellValue(row_num, 1, str(row['Line']))
-            self.results_grid.SetCellValue(row_num, 2,
-                                           f"{row['BE (eV)']:.2f}" if pd.notnull(row['BE (eV)']) else "")
-            self.results_grid.SetCellValue(row_num, 3,
-                                           str(row['Formula']) if pd.notnull(row['Formula']) else "")
-            self.results_grid.SetCellValue(row_num, 4,
-                                           str(row['Name']) if pd.notnull(row['Name']) else "")
-            self.results_grid.SetCellValue(row_num, 5,
-                                           str(row['Journal']) if pd.notnull(row['Journal']) else "")
+        # Resume redraws
+        self.results_grid.EndBatch()
 
         # Update status
-        self.status_text.SetLabel(f"{len(filtered_df)} results found")
+        self.status_text.SetLabel(f"{num_rows} results found")
 
     def on_column_click(self, event):
         """Handle column header click for sorting"""
@@ -900,7 +1004,6 @@ Version: 1.1"""
         self.Bind(wx.EVT_MENU, self.copy_journal_only, copy_journal)
         self.Bind(wx.EVT_MENU, self.search_google_scholar, search_scholar)
         self.Bind(wx.EVT_MENU, lambda e: self.show_full_info(), show_info)
-
 
         # Show menu
         self.PopupMenu(menu)
@@ -1047,17 +1150,16 @@ Version: 1.1"""
                                self.line_combo.GetStringSelection())
         plot_frame.Show()
 
-    def show_element_properties(self, event):
+    def show_element_properties_OLD(self, event):
         """Show element properties dialog"""
         if not self.selected_element:
             wx.MessageBox("Please select an element from the periodic table first.",
                           "No Element Selected", wx.OK | wx.ICON_INFORMATION)
             return
 
-        # Close existing property dialog if open and remember position, size and tab
+        # Close existing property dialog if open and remember position and tab
         if self.property_dialog:
             self.property_dialog_position = self.property_dialog.GetPosition()
-            self.property_dialog_size = self.property_dialog.GetSize()  # Add this line
             # Remember the selected tab
             try:
                 self.property_dialog_tab_index = self.property_dialog.notebook.GetSelection()
@@ -1067,17 +1169,15 @@ Version: 1.1"""
             self.property_dialog = None
 
         # Create new properties dialog
-        self.property_dialog = ElementPropertiesDialog(self, self.selected_element, self.df)
+        scholar_delay = self.config.get('scholar_load_delay_seconds', 0)
+        self.property_dialog = ElementPropertiesDialog(self, self.selected_element, self.df,
+                                                        scholar_load_delay=scholar_delay)
 
         # Set position if we have a saved one
         if self.property_dialog_position:
             self.property_dialog.SetPosition(self.property_dialog_position)
         else:
             self.property_dialog.CenterOnParent()
-
-        # Set size if we have a saved one
-        if self.property_dialog_size:
-            self.property_dialog.SetSize(self.property_dialog_size)
 
         # Set the remembered tab selection
         try:
@@ -1088,12 +1188,102 @@ Version: 1.1"""
         # Show as non-modal dialog
         self.property_dialog.Show()
 
+    def set_line_selection(self, line):
+        """Set the line selection in the combo box"""
+        try:
+            if line in [self.line_combo.GetString(i) for i in range(self.line_combo.GetCount())]:
+                self.line_combo.SetStringSelection(line)
+                self.update_results()
+        except:
+            pass
+
+    def show_element_properties(self, event):
+        """Show element properties dialog"""
+        # Default to Carbon if no element selected
+        if not self.selected_element:
+            self.selected_element = 'C'
+            self.element_label.SetLabel('C')
+            # Update line dropdown for Carbon
+            element_lines = ['All Lines'] + sorted(
+                self.df[self.df['Element'] == 'C']['Line'].unique().tolist()
+            )
+            self.line_combo.Set(element_lines)
+            # Set to 1s if available
+            if '1s' in element_lines:
+                self.line_combo.SetStringSelection('1s')
+            else:
+                self.line_combo.SetSelection(0)
+            self.update_results()
+
+        # If dialog already exists, update it with new element
+        if self.property_dialog and self.property_dialog.IsShown():
+            self.property_dialog.update_element(self.selected_element)
+            self.property_dialog.Raise()
+            return
+
+        # Create new properties dialog (pass configurable Scholar tab load delay)
+        scholar_delay = self.config.get('scholar_load_delay_seconds', 0)
+        self.property_dialog = ElementPropertiesDialog(self, self.selected_element, self.df,
+                                                        scholar_load_delay=scholar_delay)
+
+        # Position on right side of screen
+        if not self.property_dialog_position:
+            self.position_dialog_on_right()
+        else:
+            self.property_dialog.SetPosition(self.property_dialog_position)
+
+        # Set the remembered tab selection
+        try:
+            wx.CallAfter(self.property_dialog.notebook.SetSelection, self.property_dialog_tab_index)
+        except:
+            pass
+
+        # Bind close event to save position/size
+        self.property_dialog.Bind(wx.EVT_CLOSE, self.on_property_dialog_close)
+
+        # Show as non-modal dialog
+        self.property_dialog.Show()
+
+    def position_dialog_on_right(self):
+        """Position property dialog on the right side of the screen"""
+        try:
+            # Get display where periodic table is
+            display_index = wx.Display.GetFromWindow(self)
+            if display_index == wx.NOT_FOUND:
+                display_index = 0
+
+            display = wx.Display(display_index)
+            geometry = display.GetGeometry()
+
+            # Get dialog size
+            dialog_width, dialog_height = self.property_dialog.GetSize()
+
+            # Position on right side of screen
+            x = geometry.GetRight() - dialog_width - 20
+            y = geometry.GetTop() + 50
+
+            self.property_dialog.SetPosition((x, y))
+        except:
+            # Fallback to center on parent
+            self.property_dialog.CenterOnParent()
+
+    def on_property_dialog_close(self, event):
+        """Handle property dialog close to save position and size"""
+        if self.property_dialog:
+            self.property_dialog_position = self.property_dialog.GetPosition()
+            try:
+                self.property_dialog_tab_index = self.property_dialog.notebook.GetSelection()
+            except:
+                pass
+        event.Skip()
+
 
 class PlotFrame(wx.Frame):
     """Frame for displaying binding energy plots"""
 
     def __init__(self, parent, binding_energies, element, line):
         super().__init__(parent, title="Binding Energy Distribution", size=(800, 700))
+        set_app_icon(self)
 
         self.binding_energies = binding_energies
         self.element = element
@@ -1195,33 +1385,46 @@ class PlotFrame(wx.Frame):
         self.canvas.draw()
 
 
-class ElementPropertiesDialog(wx.Dialog):
+class ElementPropertiesDialog(wx.Frame):
     """Dialog for showing element properties"""
 
-    def __init__(self, parent, element, df):
-        super().__init__(parent, title=f"Properties for {element}",
-                         size=(800, 800), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+    def __init__(self, parent, element, df, scholar_load_delay=0):
+        super().__init__(parent, title=f"Other Databases & Properties for {element}",
+                         size=(1000, 900), style=wx.DEFAULT_FRAME_STYLE)
+        set_app_icon(self)
 
         self.element = element
         self.df = df
+        # Delay (in seconds) before Scholar tabs auto-load their URLs (0 = load immediately)
+        self.scholar_load_delay = max(0, int(scholar_load_delay))
 
         # Get element properties
         self.properties = self.get_element_properties(self.element)
 
         # Create UI
-        panel = wx.Panel(self)
+        panel = wx.Panel(self, style=wx.BORDER_SUNKEN)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Header
         header_panel = wx.Panel(panel)
-        header_panel.SetBackgroundColour(wx.Colour(240, 240, 240))
+
+
+        # Handle macOS dark mode
+        import platform
+        is_macos_dark = platform.system() == 'Darwin' and wx.SystemSettings.GetAppearance().IsDark()
+
+        if is_macos_dark:
+            header_panel.SetBackgroundColour(wx.Colour(45, 45, 45))
+        else:
+            # header_panel.SetBackgroundColour(wx.Colour(252, 252, 252))
+            header_panel.SetBackgroundColour(wx.WHITE)
         header_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         # Element symbol
         symbol_text = wx.StaticText(header_panel, label=element)
         symbol_font = wx.Font(40, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
         symbol_text.SetFont(symbol_font)
-        header_sizer.Add(symbol_text, 0, wx.ALL, 20)
+        header_sizer.Add(symbol_text, 0, wx.ALL, 5)
 
         # Element name and info
         info_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1235,20 +1438,26 @@ class ElementPropertiesDialog(wx.Dialog):
                                     label=f"Atomic Number: {self.properties.get('Atomic Number', 'N/A')}")
         info_sizer.Add(atomic_text, 0, wx.ALL, 5)
 
-        header_sizer.Add(info_sizer, 1, wx.ALL | wx.EXPAND, 20)
+        header_sizer.Add(info_sizer, 1, wx.ALL | wx.EXPAND, 0)
         header_panel.SetSizer(header_sizer)
 
-        # Properties notebook
-        notebook = wx.Notebook(panel)
+
+        # # Properties notebook
+        # notebook = wx.Notebook(panel)
 
         # Properties notebook
-        self.notebook = wx.Notebook(panel)  # Make sure this is self.notebook
+        self.notebook = wx.Notebook(panel, style=wx.NB_DEFAULT | wx.BORDER_RAISED)
+        self.notebook.SetBackgroundColour(wx.WHITE)
 
         # Create tabs
-        self.create_properties_tab(self.notebook)
-        self.create_xps_tab(self.notebook)
         self.create_xps_fitting_tab(self.notebook)
+        self.create_harwell_tab(self.notebook)
         self.create_thermo_tab(self.notebook)
+        self.create_sss_scholar_tab(self.notebook)
+        self.create_estr_scholar_tab(self.notebook)
+        # self.create_useful_pdf_tab(self.notebook)
+        self.create_properties_tab(self.notebook)
+        # self.create_xps_tab(self.notebook)
 
         # Bind notebook page change event to track selections
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
@@ -1272,6 +1481,206 @@ class ElementPropertiesDialog(wx.Dialog):
         except:
             pass
         event.Skip()  # Allow the event to continue processing
+
+    def update_element(self, new_element):
+        """Update the dialog to show a different element without recreating tabs"""
+        self.element = new_element
+        self.properties = self.get_element_properties(new_element)
+
+        # Update title
+        self.SetTitle(f"Other Databases & Properties for {new_element}")
+
+        # Get the main panel
+        panel = self.GetChildren()[0]
+        main_sizer = panel.GetSizer()
+
+        # Remove existing header
+        old_header = main_sizer.GetItem(0).GetWindow()
+        main_sizer.Detach(old_header)
+        old_header.Destroy()
+
+        # Create new header
+        header_panel = wx.Panel(panel)
+        header_panel.SetBackgroundColour(wx.WHITE)
+
+        header_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        # Element symbol
+        symbol_text = wx.StaticText(header_panel, label=new_element)
+        symbol_font = wx.Font(40, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+        symbol_text.SetFont(symbol_font)
+        header_sizer.Add(symbol_text, 0, wx.ALL, 5)
+
+        # Element name and info
+        info_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        name_text = wx.StaticText(header_panel, label=self.properties.get("Name", new_element))
+        name_font = wx.Font(20, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        name_text.SetFont(name_font)
+        info_sizer.Add(name_text, 0, wx.ALL, 5)
+
+        atomic_text = wx.StaticText(header_panel,
+                                    label=f"Atomic Number: {self.properties.get('Atomic Number', 'N/A')}")
+        info_sizer.Add(atomic_text, 0, wx.ALL, 5)
+
+        header_sizer.Add(info_sizer, 1, wx.ALL | wx.EXPAND, 5)
+        header_panel.SetSizer(header_sizer)
+
+        # Insert new header at the beginning
+        main_sizer.Insert(0, header_panel, 0, wx.ALL | wx.EXPAND, 0)
+
+        # Update web views URLs WITHOUT destroying them
+        if hasattr(self, 'xps_web_view'):
+            try:
+                new_xps_url = self.get_xps_fitting_url(new_element)
+                self.xps_url = new_xps_url
+                if hasattr(self, 'xps_loading_text'):
+                    self.xps_loading_text.SetLabel(f"Loading XPS Fitting database page for {new_element}...")
+                    self.xps_loading_text.Show()
+                wx.CallAfter(self.xps_web_view.LoadURL, new_xps_url)
+            except:
+                pass
+
+        if hasattr(self, 'web_view'):
+            try:
+                new_thermo_url = self.get_thermo_url(new_element)
+                self.thermo_url = new_thermo_url
+                if hasattr(self, 'loading_text'):
+                    self.loading_text.SetLabel(f"Loading Thermo Fisher knowledge page for {new_element}...")
+                    self.loading_text.Show()
+                wx.CallAfter(self.web_view.LoadURL, new_thermo_url)
+            except:
+                pass
+
+        if hasattr(self, 'harwell_web_view'):
+            try:
+                new_harwell_url = self.get_harwell_url(new_element)
+                self.harwell_url = new_harwell_url
+                if hasattr(self, 'harwell_loading_text'):
+                    self.harwell_loading_text.SetLabel(f"Loading Harwell XPS Guru page for {new_element}...")
+                    self.harwell_loading_text.Show()
+                wx.CallAfter(self.harwell_web_view.LoadURL, new_harwell_url)
+            except:
+                pass
+
+        # Update only the data tabs (Properties and XPS Data)
+        # Find and update these tabs by searching for them
+        for i in range(self.notebook.GetPageCount()):
+            page_title = self.notebook.GetPageText(i)
+
+            if page_title == "General Properties":
+                self.update_properties_tab_content(self.notebook.GetPage(i))
+
+        # Update layout
+        panel.Layout()
+        self.Refresh()
+
+    def update_properties_tab_content(self, properties_page):
+        """Update the properties tab content without recreating the page"""
+        try:
+            # Get the scrolled window (first child of the page)
+            scrolled = properties_page.GetChildren()[0]
+
+            # Clear existing content
+            old_sizer = scrolled.GetSizer()
+            if old_sizer:
+                old_sizer.Clear(True)
+
+            # Create new grid sizer
+            grid_sizer = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
+
+            # Property groups
+            property_groups = {
+                "Physical Properties": ["Atomic Mass", "Density", "Melting Point", "Boiling Point", "State at 20°C"],
+                "Atomic Properties": ["Electron Configuration", "Electronegativity", "Atomic Radius", "Ionization Energy"],
+                "General Information": ["Group", "Period", "Category", "Discovered By", "Year of Discovery"],
+                "Online Resources": ["XPS Fitting URL", "Thermo Fisher URL"]
+            }
+
+            for group_name, properties in property_groups.items():
+                # Group header
+                header = wx.StaticText(scrolled, label=group_name)
+                header_font = wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+                header.SetFont(header_font)
+                grid_sizer.Add(header, 0, wx.ALL | wx.EXPAND, 5)
+                grid_sizer.Add(wx.StaticText(scrolled, label=""), 0)
+
+                # Properties
+                for prop in properties:
+                    label = wx.StaticText(scrolled, label=f"{prop}:")
+
+                    if prop.endswith("URL"):
+                        url = str(self.properties.get(prop, "N/A"))
+                        if url != "N/A":
+                            link_label = "XPS Fitting" if "xpsfitting" in url else "Thermo Fisher"
+                            value = wx.adv.HyperlinkCtrl(scrolled, label=link_label, url=url)
+                        else:
+                            value = wx.StaticText(scrolled, label="N/A")
+                    else:
+                        value = wx.StaticText(scrolled, label=str(self.properties.get(prop, "N/A")))
+
+                    grid_sizer.Add(label, 0, wx.ALL | wx.ALIGN_RIGHT, 3)
+                    grid_sizer.Add(value, 0, wx.ALL, 3)
+
+            scrolled.SetSizer(grid_sizer)
+            scrolled.Layout()
+            scrolled.FitInside()
+        except:
+            pass
+
+    def update_xps_tab_content(self, xps_page):
+        """Update the XPS data tab content without recreating the page"""
+        try:
+            # Clear existing content
+            old_sizer = xps_page.GetSizer()
+            if old_sizer:
+                old_sizer.Clear(True)
+
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            # Get XPS data for new element
+            element_data = self.df[self.df['Element'] == self.element]
+
+            if not element_data.empty:
+                # Create grid
+                grid = wx.grid.Grid(xps_page)
+                grid.HideRowLabels()
+
+                # Group by line
+                lines_summary = element_data.groupby('Line')['BE (eV)'].agg(
+                    ['mean', 'count', 'min', 'max']).reset_index()
+
+                grid.CreateGrid(len(lines_summary), 5)
+                grid.SetColLabelValue(0, "Line")
+                grid.SetColLabelValue(1, "Avg BE (eV)")
+                grid.SetColLabelValue(2, "Min BE (eV)")
+                grid.SetColLabelValue(3, "Max BE (eV)")
+                grid.SetColLabelValue(4, "N# of References")
+
+                grid.SetColSize(0, 80)
+                grid.SetColSize(1, 100)
+                grid.SetColSize(2, 100)
+                grid.SetColSize(3, 100)
+                grid.SetColSize(4, 80)
+
+                for i, (_, row) in enumerate(lines_summary.iterrows()):
+                    grid.SetCellValue(i, 0, str(row['Line']))
+                    grid.SetCellValue(i, 1, f"{row['mean']:.2f}")
+                    grid.SetCellValue(i, 2, f"{row['min']:.2f}")
+                    grid.SetCellValue(i, 3, f"{row['max']:.2f}")
+                    grid.SetCellValue(i, 4, str(int(row['count'])))
+
+                grid.EnableEditing(False)
+                sizer.Add(grid, 1, wx.ALL | wx.EXPAND, 5)
+            else:
+                label = wx.StaticText(xps_page, label=f"No XPS data available for {self.element}")
+                sizer.Add(label, 0, wx.ALL | wx.CENTER, 20)
+
+            xps_page.SetSizer(sizer)
+            xps_page.Layout()
+        except:
+            pass
+
 
     def create_properties_tab(self, notebook):
         """Create general properties tab"""
@@ -1319,7 +1728,7 @@ class ElementPropertiesDialog(wx.Dialog):
                 grid_sizer.Add(value, 0, wx.ALL, 3)
 
         scrolled.SetSizer(grid_sizer)
-        sizer.Add(scrolled, 1, wx.ALL | wx.EXPAND, 5)
+        sizer.Add(scrolled, 1, wx.ALL | wx.EXPAND, 0)
         panel.SetSizer(sizer)
 
         notebook.AddPage(panel, "General Properties")
@@ -1385,14 +1794,23 @@ class ElementPropertiesDialog(wx.Dialog):
             toolbar_panel = wx.Panel(panel)
             toolbar_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-            refresh_btn = wx.Button(toolbar_panel, label="Refresh")
-            refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_thermo)
+            back_btn = wx.Button(toolbar_panel, label="◄ Back")
+            back_btn.Bind(wx.EVT_BUTTON, self.on_thermo_back)
+
+            forward_btn = wx.Button(toolbar_panel, label="Forward ►")
+            forward_btn.Bind(wx.EVT_BUTTON, self.on_thermo_forward)
+
+            home_btn = wx.Button(toolbar_panel, label="Home")
+            home_btn.Bind(wx.EVT_BUTTON, self.on_thermo_home)
+
+            zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
+            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_thermo_zoom_out)
 
             zoom_in_btn = wx.Button(toolbar_panel, label="+", size=(30, -1))
             zoom_in_btn.Bind(wx.EVT_BUTTON, self.on_thermo_zoom_in)
 
-            zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
-            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_thermo_zoom_out)
+            refresh_btn = wx.Button(toolbar_panel, label="Refresh")
+            refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_thermo)
 
             url_label = wx.StaticText(toolbar_panel, label="Thermo Fisher Knowledge Base")
             font = url_label.GetFont()
@@ -1400,9 +1818,12 @@ class ElementPropertiesDialog(wx.Dialog):
             url_label.SetFont(font)
 
             toolbar_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            toolbar_sizer.Add(back_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(forward_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(home_btn, 0, wx.ALL, 2)
             toolbar_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
             toolbar_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
-            toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 5)
+            toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 2)
             toolbar_panel.SetSizer(toolbar_sizer)
 
             # Create web view control
@@ -1422,9 +1843,9 @@ class ElementPropertiesDialog(wx.Dialog):
             self.web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, self.on_page_loaded)
             self.web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, self.on_page_error)
 
-            sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 2)
-            sizer.Add(loading_text, 0, wx.ALL | wx.EXPAND, 5)
-            sizer.Add(self.web_view, 1, wx.ALL | wx.EXPAND, 5)
+            sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 0)
+            # sizer.Add(loading_text, 0, wx.ALL | wx.EXPAND, 5)
+            sizer.Add(self.web_view, 1, wx.ALL | wx.EXPAND, 0)
 
             # Store reference to loading text for removal later
             self.loading_text = loading_text
@@ -1438,6 +1859,208 @@ class ElementPropertiesDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
         notebook.AddPage(panel, "Thermo Knowledge")
+
+    def create_harwell_tab(self, notebook):
+        """Create Harwell XPS Guru tab with embedded web browser"""
+        panel = wx.Panel(notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        try:
+            # Create toolbar with refresh and zoom buttons
+            toolbar_panel = wx.Panel(panel)
+            toolbar_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+            back_btn = wx.Button(toolbar_panel, label="◄ Back")
+            back_btn.Bind(wx.EVT_BUTTON, self.on_harwell_back)
+
+            forward_btn = wx.Button(toolbar_panel, label="Forward ►")
+            forward_btn.Bind(wx.EVT_BUTTON, self.on_harwell_forward)
+
+            home_btn = wx.Button(toolbar_panel, label="Home")
+            home_btn.Bind(wx.EVT_BUTTON, self.on_harwell_home)
+
+            zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
+            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_harwell_zoom_out)
+
+            zoom_in_btn = wx.Button(toolbar_panel, label="+", size=(30, -1))
+            zoom_in_btn.Bind(wx.EVT_BUTTON, self.on_harwell_zoom_in)
+
+            refresh_btn = wx.Button(toolbar_panel, label="Refresh")
+            refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_harwell)
+
+            url_label = wx.StaticText(toolbar_panel, label="Harwell XPS Guru")
+            font = url_label.GetFont()
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+            url_label.SetFont(font)
+
+            toolbar_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            toolbar_sizer.Add(back_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(forward_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(home_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 2)
+            toolbar_panel.SetSizer(toolbar_sizer)
+
+            # Create web view control
+            self.harwell_web_view = wx.html2.WebView.New(panel)
+
+            # Get the Harwell XPS URL for this element
+            self.harwell_url = self.get_harwell_url(self.element)
+
+            # Load the Harwell XPS Guru page immediately (no delay)
+            self.harwell_web_view.LoadURL(self.harwell_url)
+
+            # Add loading indicator
+            harwell_loading_text = wx.StaticText(panel, label="Loading Harwell XPS Guru page...")
+            harwell_loading_text.SetForegroundColour(wx.Colour(100, 100, 100))
+
+            # Bind events to handle loading
+            self.harwell_web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, self.on_harwell_page_loaded)
+            self.harwell_web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, self.on_harwell_page_error)
+
+            sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 1)
+            # sizer.Add(harwell_loading_text, 0, wx.ALL | wx.EXPAND, 1)
+            sizer.Add(self.harwell_web_view, 1, wx.ALL | wx.EXPAND, 0)
+
+            # Store reference to loading text for removal later
+            self.harwell_loading_text = harwell_loading_text
+
+        except Exception as e:
+            # Fallback if WebView is not available
+            error_text = wx.StaticText(panel,
+                                       label=f"Web browser not available.\n\nPlease visit:\n{self.get_harwell_url(self.element)}")
+            error_text.Wrap(400)
+            sizer.Add(error_text, 1, wx.ALL | wx.EXPAND, 20)
+
+        panel.SetSizer(sizer)
+        notebook.AddPage(panel, "Harwell XPS Guru")
+
+    def on_harwell_back(self, event):
+        """Navigate back in Harwell web view"""
+        try:
+            if self.harwell_web_view.CanGoBack():
+                self.harwell_web_view.GoBack()
+        except:
+            pass
+
+    def on_harwell_forward(self, event):
+        """Navigate forward in Harwell web view"""
+        try:
+            if self.harwell_web_view.CanGoForward():
+                self.harwell_web_view.GoForward()
+        except:
+            pass
+
+    def on_harwell_home(self, event):
+        """Go to home page for Harwell XPS Guru"""
+        try:
+            self.harwell_web_view.LoadURL(self.harwell_url)
+        except:
+            pass
+
+    def on_refresh_harwell(self, event):
+        """Refresh the Harwell XPS page"""
+        try:
+            self.harwell_loading_text.SetLabel("Refreshing page...")
+            self.harwell_loading_text.Show()
+            self.harwell_web_view.Reload()
+            self.Layout()
+        except:
+            pass
+
+    def on_harwell_zoom_in(self, event):
+        """Zoom in the Harwell web view using JavaScript"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.harwell_web_view.RunScript(script)
+        except:
+            pass
+
+    def on_harwell_zoom_out(self, event):
+        """Zoom out the Harwell web view using JavaScript"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.harwell_web_view.RunScript(script)
+        except:
+            pass
+
+    def on_harwell_page_loaded(self, event):
+        """Handle successful Harwell page loading"""
+        try:
+            self.harwell_loading_text.Hide()
+
+            # Delay the zoom script slightly to ensure page is ready
+            def set_zoom():
+                try:
+                    script = """
+                    (function() {
+                        try {
+                            if (document && document.body && document.body.style) {
+                                document.body.style.zoom = '0.8';
+                            }
+                        } catch(e) {}
+                    })();
+                    """
+                    self.harwell_web_view.RunScript(script)
+                except:
+                    pass
+
+            wx.CallLater(100, set_zoom)
+            self.Layout()
+        except:
+            pass
+
+    def on_harwell_page_error(self, event):
+        """Handle Harwell page loading errors"""
+        try:
+            self.harwell_loading_text.SetLabel("Failed to load webpage. Please check your internet connection.")
+            self.harwell_loading_text.SetForegroundColour(wx.Colour(200, 0, 0))
+        except:
+            pass
+
+    def on_thermo_back(self, event):
+        """Navigate back in Thermo Knowledge web view"""
+        try:
+            if self.web_view.CanGoBack():
+                self.web_view.GoBack()
+        except:
+            pass
+
+    def on_thermo_forward(self, event):
+        """Navigate forward in Thermo Knowledge web view"""
+        try:
+            if self.web_view.CanGoForward():
+                self.web_view.GoForward()
+        except:
+            pass
+
+    def on_thermo_home(self, event):
+        """Go to home page for Thermo Knowledge"""
+        try:
+            self.web_view.LoadURL(self.thermo_url)
+        except:
+            pass
 
     def on_refresh_thermo(self, event):
         """Refresh the Thermo Fisher page"""
@@ -1459,14 +2082,23 @@ class ElementPropertiesDialog(wx.Dialog):
             toolbar_panel = wx.Panel(panel)
             toolbar_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-            refresh_btn = wx.Button(toolbar_panel, label="Refresh")
-            refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_xps)
+            back_btn = wx.Button(toolbar_panel, label="◄ Back")
+            back_btn.Bind(wx.EVT_BUTTON, self.on_xps_back)
+
+            forward_btn = wx.Button(toolbar_panel, label="Forward ►")
+            forward_btn.Bind(wx.EVT_BUTTON, self.on_xps_forward)
+
+            home_btn = wx.Button(toolbar_panel, label="Home")
+            home_btn.Bind(wx.EVT_BUTTON, self.on_xps_home)
+
+            zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
+            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_xps_zoom_out)
 
             zoom_in_btn = wx.Button(toolbar_panel, label="+", size=(30, -1))
             zoom_in_btn.Bind(wx.EVT_BUTTON, self.on_xps_zoom_in)
 
-            zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
-            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_xps_zoom_out)
+            refresh_btn = wx.Button(toolbar_panel, label="Refresh")
+            refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_xps)
 
             url_label = wx.StaticText(toolbar_panel, label="XPS Fitting Database")
             font = url_label.GetFont()
@@ -1474,9 +2106,12 @@ class ElementPropertiesDialog(wx.Dialog):
             url_label.SetFont(font)
 
             toolbar_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            toolbar_sizer.Add(back_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(forward_btn, 0, wx.ALL, 2)
+            toolbar_sizer.Add(home_btn, 0, wx.ALL, 2)
             toolbar_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
             toolbar_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
-            toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 5)
+            toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 2)
             toolbar_panel.SetSizer(toolbar_sizer)
             # Create web view control
             self.xps_web_view = wx.html2.WebView.New(panel)
@@ -1495,9 +2130,9 @@ class ElementPropertiesDialog(wx.Dialog):
             self.xps_web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, self.on_xps_page_loaded)
             self.xps_web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, self.on_xps_page_error)
 
-            sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 2)
-            sizer.Add(xps_loading_text, 0, wx.ALL | wx.EXPAND, 5)
-            sizer.Add(self.xps_web_view, 1, wx.ALL | wx.EXPAND, 5)
+            sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 0)
+            # sizer.Add(xps_loading_text, 0, wx.ALL | wx.EXPAND, 1)
+            sizer.Add(self.xps_web_view, 1, wx.ALL | wx.EXPAND, 0)
 
             # Store reference to loading text for removal later
             self.xps_loading_text = xps_loading_text
@@ -1519,6 +2154,29 @@ class ElementPropertiesDialog(wx.Dialog):
             self.xps_loading_text.Show()
             self.xps_web_view.Reload()
             self.Layout()
+        except:
+            pass
+
+    def on_xps_back(self, event):
+        """Navigate back in XPS Fitting web view"""
+        try:
+            if self.xps_web_view.CanGoBack():
+                self.xps_web_view.GoBack()
+        except:
+            pass
+
+    def on_xps_forward(self, event):
+        """Navigate forward in XPS Fitting web view"""
+        try:
+            if self.xps_web_view.CanGoForward():
+                self.xps_web_view.GoForward()
+        except:
+            pass
+
+    def on_xps_home(self, event):
+        """Go to home page for XPS Fitting"""
+        try:
+            self.xps_web_view.LoadURL(self.xps_url)
         except:
             pass
 
@@ -1544,7 +2202,14 @@ class ElementPropertiesDialog(wx.Dialog):
         """Zoom in the XPS web view using JavaScript"""
         try:
             script = """
-            document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) * 1.1).toString();
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
             """
             self.xps_web_view.RunScript(script)
         except:
@@ -1554,10 +2219,16 @@ class ElementPropertiesDialog(wx.Dialog):
         """Zoom out the XPS web view using JavaScript"""
         try:
             script = """
-            var currentZoom = parseFloat(document.body.style.zoom || 1);
-            if (currentZoom > 0.5) {
-                document.body.style.zoom = (currentZoom / 1.1).toString();
-            }
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
             """
             self.xps_web_view.RunScript(script)
         except:
@@ -1567,7 +2238,14 @@ class ElementPropertiesDialog(wx.Dialog):
         """Zoom in the Thermo web view using JavaScript"""
         try:
             script = """
-            document.body.style.zoom = (parseFloat(document.body.style.zoom || 1) * 1.1).toString();
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
             """
             self.web_view.RunScript(script)
         except:
@@ -1577,15 +2255,20 @@ class ElementPropertiesDialog(wx.Dialog):
         """Zoom out the Thermo web view using JavaScript"""
         try:
             script = """
-            var currentZoom = parseFloat(document.body.style.zoom || 1);
-            if (currentZoom > 0.5) {
-                document.body.style.zoom = (currentZoom / 1.1).toString();
-            }
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
             """
             self.web_view.RunScript(script)
         except:
             pass
-
     def on_page_loaded(self, event):
         """Handle successful page loading"""
         try:
@@ -1684,6 +2367,36 @@ class ElementPropertiesDialog(wx.Dialog):
 
         category_path = element_categories.get(element_symbol, f'unknown/{element_symbol.lower()}')
         return f"https://www.thermofisher.com/uk/en/home/materials-science/learning-center/periodic-table/{category_path}.html"
+
+    def get_harwell_url(self, element_symbol):
+        """Generate Harwell XPS Guru URL for element"""
+        # Map element symbols to full element names in lowercase
+        element_names = {
+            'H': 'hydrogen', 'He': 'helium', 'Li': 'lithium', 'Be': 'beryllium', 'B': 'boron',
+            'C': 'carbon', 'N': 'nitrogen', 'O': 'oxygen', 'F': 'fluorine', 'Ne': 'neon',
+            'Na': 'sodium', 'Mg': 'magnesium', 'Al': 'aluminium', 'Si': 'silicon', 'P': 'phosphorus',
+            'S': 'sulfur', 'Cl': 'chlorine', 'Ar': 'argon', 'K': 'potassium', 'Ca': 'calcium',
+            'Sc': 'scandium', 'Ti': 'titanium', 'V': 'vanadium', 'Cr': 'chromium', 'Mn': 'manganese',
+            'Fe': 'iron', 'Co': 'cobalt', 'Ni': 'nickel', 'Cu': 'copper', 'Zn': 'zinc',
+            'Ga': 'gallium', 'Ge': 'germanium', 'As': 'arsenic', 'Se': 'selenium', 'Br': 'bromine',
+            'Kr': 'krypton', 'Rb': 'rubidium', 'Sr': 'strontium', 'Y': 'yttrium', 'Zr': 'zirconium',
+            'Nb': 'niobium', 'Mo': 'molybdenum', 'Tc': 'technetium', 'Ru': 'ruthenium', 'Rh': 'rhodium',
+            'Pd': 'palladium', 'Ag': 'silver', 'Cd': 'cadmium', 'In': 'indium', 'Sn': 'tin',
+            'Sb': 'antimony', 'Te': 'tellurium', 'I': 'iodine', 'Xe': 'xenon', 'Cs': 'caesium',
+            'Ba': 'barium', 'La': 'lanthanum', 'Ce': 'cerium', 'Pr': 'praseodymium', 'Nd': 'neodymium',
+            'Pm': 'promethium', 'Sm': 'samarium', 'Eu': 'europium', 'Gd': 'gadolinium', 'Tb': 'terbium',
+            'Dy': 'dysprosium', 'Ho': 'holmium', 'Er': 'erbium', 'Tm': 'thulium', 'Yb': 'ytterbium',
+            'Lu': 'lutetium', 'Hf': 'hafnium', 'Ta': 'tantalum', 'W': 'tungsten', 'Re': 'rhenium',
+            'Os': 'osmium', 'Ir': 'iridium', 'Pt': 'platinum', 'Au': 'gold', 'Hg': 'mercury',
+            'Tl': 'thallium', 'Pb': 'lead', 'Bi': 'bismuth', 'Po': 'polonium', 'At': 'astatine',
+            'Rn': 'radon', 'Fr': 'francium', 'Ra': 'radium', 'Ac': 'actinium', 'Th': 'thorium',
+            'Pa': 'protactinium', 'U': 'uranium', 'Np': 'neptunium', 'Pu': 'plutonium', 'Am': 'americium',
+            'Cm': 'curium', 'Bk': 'berkelium', 'Cf': 'californium', 'Es': 'einsteinium', 'Fm': 'fermium',
+            'Md': 'mendelevium', 'No': 'nobelium', 'Lr': 'lawrencium'
+        }
+
+        element_name = element_names.get(element_symbol, element_symbol.lower())
+        return f"https://www.harwellxps.guru/xpskb/{element_name}/"
 
     def get_element_properties(self, element_symbol):
         """Get properties for a specific element"""
@@ -3501,16 +4214,773 @@ class ElementPropertiesDialog(wx.Dialog):
 
         return properties
 
+    def create_sss_scholar_tab(self, notebook):
+        """Create SSS from Scholar tab with search and navigation"""
+        panel = wx.Panel(notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        try:
+            # Create search toolbar
+            search_panel = wx.Panel(panel)
+            search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+            search_label = wx.StaticText(search_panel, label="Search:")
+            self.sss_search_ctrl = wx.TextCtrl(search_panel, style=wx.TE_PROCESS_ENTER)
+            self.sss_search_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_sss_search)
+
+            search_btn = wx.Button(search_panel, label="Search")
+            search_btn.Bind(wx.EVT_BUTTON, self.on_sss_search)
+
+            search_sizer.Add(search_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            search_sizer.Add(self.sss_search_ctrl, 1, wx.ALL | wx.EXPAND, 5)
+            search_sizer.Add(search_btn, 0, wx.ALL, 5)
+            search_panel.SetSizer(search_sizer)
+
+            # Create navigation toolbar
+            nav_panel = wx.Panel(panel)
+            nav_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+            back_btn = wx.Button(nav_panel, label="◄ Back")
+            back_btn.Bind(wx.EVT_BUTTON, self.on_sss_back)
+
+            forward_btn = wx.Button(nav_panel, label="Forward ►")
+            forward_btn.Bind(wx.EVT_BUTTON, self.on_sss_forward)
+
+            home_btn = wx.Button(nav_panel, label="Home")
+            home_btn.Bind(wx.EVT_BUTTON, self.on_sss_home)
+
+            refresh_btn = wx.Button(nav_panel, label="Refresh")
+            refresh_btn.Bind(wx.EVT_BUTTON, self.on_sss_refresh)
+
+            zoom_out_btn = wx.Button(nav_panel, label="-", size=(30, -1))
+            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_sss_zoom_out)
+
+            zoom_in_btn = wx.Button(nav_panel, label="+", size=(30, -1))
+            zoom_in_btn.Bind(wx.EVT_BUTTON, self.on_sss_zoom_in)
+
+            url_label = wx.StaticText(nav_panel, label="Surface Science Spectra from Scholar")
+            font = url_label.GetFont()
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+            url_label.SetFont(font)
+
+            nav_sizer.Add(back_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(forward_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(home_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            nav_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(refresh_btn, 0, wx.ALL, 2)
+            nav_panel.SetSizer(nav_sizer)
+
+            # Create web view control
+            self.sss_web_view = wx.html2.WebView.New(panel)
+
+            # Set home URL (Google Scholar search page)
+            self.sss_home_url = "https://scholar.google.com/"
+
+            # Deferred loading: show placeholder HTML until delay expires
+            delay_sec = self.scholar_load_delay
+            if delay_sec > 0:
+                placeholder_html = (
+                    f"<html><body style='font-family:sans-serif; padding:40px; color:#555;'>"
+                    f"<h2>&#128336; Loading paused</h2>"
+                    f"<p>The <b>SSS from Scholar</b> tab will automatically load Google Scholar "
+                    f"in <b>{delay_sec} second{'s' if delay_sec != 1 else ''}</b>.</p>"
+                    f"<p>You can also click <b>Home</b> or <b>Search</b> to load it immediately.</p>"
+                    f"</body></html>"
+                )
+                self.sss_web_view.SetPage(placeholder_html, "")
+                wx.CallLater(delay_sec * 1000, self._sss_deferred_load)
+            else:
+                self.sss_web_view.LoadURL(self.sss_home_url)
+
+            # Add loading indicator
+            sss_loading_text = wx.StaticText(panel, label="Ready to search Surface Science Spectra...")
+            sss_loading_text.SetForegroundColour(wx.Colour(100, 100, 100))
+
+            # Bind events to handle loading
+            self.sss_web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, self.on_sss_page_loaded)
+            self.sss_web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, self.on_sss_page_error)
+            self.sss_web_view.Bind(wx.html2.EVT_WEBVIEW_NAVIGATING, self.on_sss_navigating)  # ADD THIS LINE
+            self.sss_web_view.Bind(wx.html2.EVT_WEBVIEW_NEWWINDOW, self.on_sss_new_window)  # ADD THIS LINE
+
+            sizer.Add(search_panel, 0, wx.ALL | wx.EXPAND, 0)
+            sizer.Add(nav_panel, 0, wx.ALL | wx.EXPAND, 0)
+            # sizer.Add(sss_loading_text, 0, wx.ALL | wx.EXPAND, 5)
+            sizer.Add(self.sss_web_view, 1, wx.ALL | wx.EXPAND, 0)
+
+            # Store reference to loading text
+            self.sss_loading_text = sss_loading_text
+
+        except Exception as e:
+            # Fallback if WebView is not available
+            error_text = wx.StaticText(panel,
+                                       label="Web browser not available.\n\nPlease visit Google Scholar directly:\nhttps://scholar.google.com/")
+            error_text.Wrap(400)
+            sizer.Add(error_text, 1, wx.ALL | wx.EXPAND, 20)
+
+        panel.SetSizer(sizer)
+        notebook.AddPage(panel, "SSS from Scholar")
+
+    def on_sss_search(self, event):
+        """Perform Surface Science Spectra search on Google Scholar"""
+        try:
+            search_terms = self.sss_search_ctrl.GetValue().strip()
+            if not search_terms:
+                return
+
+            # Build the search query
+            import urllib.parse
+            query = f'source:"Surface Science Spectra" XPS {search_terms}'
+            encoded_query = urllib.parse.quote(query)
+            search_url = f"https://scholar.google.com/scholar?q={encoded_query}"
+
+            self.sss_loading_text.SetLabel(f"Searching for: {search_terms}")
+            self.sss_loading_text.Show()
+            self.sss_web_view.LoadURL(search_url)
+        except Exception as e:
+            wx.MessageBox(f"Search failed: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_sss_back(self, event):
+        """Navigate back in SSS web view"""
+        try:
+            if self.sss_web_view.CanGoBack():
+                self.sss_web_view.GoBack()
+        except:
+            pass
+
+    def on_sss_forward(self, event):
+        """Navigate forward in SSS web view"""
+        try:
+            if self.sss_web_view.CanGoForward():
+                self.sss_web_view.GoForward()
+        except:
+            pass
+
+    def on_sss_home(self, event):
+        """Go to home page (Google Scholar)"""
+        try:
+            self.sss_loading_text.SetLabel("Loading Google Scholar...")
+            self.sss_loading_text.Show()
+            self.sss_web_view.LoadURL(self.sss_home_url)
+        except:
+            pass
+
+    def on_sss_refresh(self, event):
+        """Refresh the SSS page"""
+        try:
+            self.sss_loading_text.SetLabel("Refreshing page...")
+            self.sss_loading_text.Show()
+            self.sss_web_view.Reload()
+        except:
+            pass
+
+    def on_sss_zoom_in(self, event):
+        """Zoom in the SSS web view"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.sss_web_view.RunScript(script)
+        except:
+            pass
+
+    def on_sss_zoom_out(self, event):
+        """Zoom out the SSS web view"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.sss_web_view.RunScript(script)
+        except:
+            pass
+
+    def on_sss_page_loaded(self, event):
+        """Handle successful SSS page loading"""
+        try:
+            self.sss_loading_text.Hide()
+            self.Layout()
+        except:
+            pass
+
+    def on_sss_page_error(self, event):
+        """Handle SSS page loading errors"""
+        try:
+            self.sss_loading_text.SetLabel("Failed to load webpage. Please check your internet connection.")
+            self.sss_loading_text.SetForegroundColour(wx.Colour(200, 0, 0))
+        except:
+            pass
+
+    def on_sss_navigating(self, event):
+        """Handle navigation events to intercept downloads"""
+        url = event.GetURL()
+
+        # Check if this looks like a file download
+        download_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.csv', '.txt']
+
+        if any(url.lower().endswith(ext) for ext in download_extensions):
+            event.Veto()  # Prevent web view from handling it
+            self.download_file(url)
+        else:
+            event.Skip()  # Allow normal navigation
+
+    def on_sss_new_window(self, event):
+        """Handle new window requests (often used for downloads)"""
+        url = event.GetURL()
+
+        # Check if this is a download link
+        download_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.csv', '.txt']
+
+        if any(url.lower().endswith(ext) for ext in download_extensions):
+            event.Veto()  # Don't open new window
+            self.download_file(url)
+        else:
+            # For non-download links, load in current view
+            event.Veto()
+            self.sss_web_view.LoadURL(url)
+
+    def download_file(self, url):
+        """Download a file to the Downloads folder"""
+        try:
+            import urllib.request
+            import os
+            from pathlib import Path
+
+            # Get the Downloads folder
+            if os.name == 'nt':  # Windows
+                downloads_folder = str(Path.home() / "Downloads")
+            else:  # Mac/Linux
+                downloads_folder = str(Path.home() / "Downloads")
+
+            # Extract filename from URL
+            filename = url.split('/')[-1].split('?')[0]  # Remove query parameters
+            if not filename:
+                filename = "download"
+
+            filepath = os.path.join(downloads_folder, filename)
+
+            # Show downloading message
+            dlg = wx.ProgressDialog("Downloading",
+                                    f"Downloading {filename}...",
+                                    maximum=100,
+                                    parent=self,
+                                    style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE)
+
+            # Download the file
+            def download_progress(block_count, block_size, total_size):
+                if total_size > 0:
+                    percent = int((block_count * block_size * 100) / total_size)
+                    wx.CallAfter(dlg.Update, min(percent, 100))
+
+            urllib.request.urlretrieve(url, filepath, reporthook=download_progress)
+            dlg.Destroy()
+
+            # Show success message
+            wx.MessageBox(f"File downloaded successfully to:\n{filepath}",
+                          "Download Complete",
+                          wx.OK | wx.ICON_INFORMATION)
+
+        except Exception as e:
+            try:
+                dlg.Destroy()
+            except:
+                pass
+            wx.MessageBox(f"Download failed: {str(e)}\n\nURL: {url}",
+                          "Download Error",
+                          wx.OK | wx.ICON_ERROR)
+
+
+    def create_estr_scholar_tab(self, notebook):
+        """Create Electronic Structure Scholar tab with search and navigation"""
+        panel = wx.Panel(notebook)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        try:
+            # Create search toolbar
+            search_panel = wx.Panel(panel)
+            search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+            search_label = wx.StaticText(search_panel, label="Search:")
+            self.estr_search_ctrl = wx.TextCtrl(search_panel, style=wx.TE_PROCESS_ENTER)
+            self.estr_search_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_estr_search)
+
+            search_btn = wx.Button(search_panel, label="Search")
+            search_btn.Bind(wx.EVT_BUTTON, self.on_estr_search)
+
+            # Add checkbox for high citations filter
+            self.estr_high_citations_cb = wx.CheckBox(search_panel, label="High Citations")
+            self.estr_high_citations_cb.SetValue(True)
+
+            search_sizer.Add(search_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            search_sizer.Add(self.estr_search_ctrl, 1, wx.ALL | wx.EXPAND, 5)
+            search_sizer.Add(self.estr_high_citations_cb, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            search_sizer.Add(search_btn, 0, wx.ALL, 5)
+            search_panel.SetSizer(search_sizer)
+
+            # Create navigation toolbar
+            nav_panel = wx.Panel(panel)
+            nav_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+            back_btn = wx.Button(nav_panel, label="◄ Back")
+            back_btn.Bind(wx.EVT_BUTTON, self.on_estr_back)
+
+            forward_btn = wx.Button(nav_panel, label="Forward ►")
+            forward_btn.Bind(wx.EVT_BUTTON, self.on_estr_forward)
+
+            home_btn = wx.Button(nav_panel, label="Home")
+            home_btn.Bind(wx.EVT_BUTTON, self.on_estr_home)
+
+            refresh_btn = wx.Button(nav_panel, label="Refresh")
+            refresh_btn.Bind(wx.EVT_BUTTON, self.on_estr_refresh)
+
+            zoom_out_btn = wx.Button(nav_panel, label="-", size=(30, -1))
+            zoom_out_btn.Bind(wx.EVT_BUTTON, self.on_estr_zoom_out)
+
+            zoom_in_btn = wx.Button(nav_panel, label="+", size=(30, -1))
+            zoom_in_btn.Bind(wx.EVT_BUTTON, self.on_estr_zoom_in)
+
+            url_label = wx.StaticText(nav_panel, label="Electronic Structure Scholar")
+            font = url_label.GetFont()
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+            url_label.SetFont(font)
+
+            nav_sizer.Add(back_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(forward_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(home_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+            nav_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
+            nav_sizer.Add(refresh_btn, 0, wx.ALL, 2)
+            nav_panel.SetSizer(nav_sizer)
+
+            # Create web view control
+            self.estr_web_view = wx.html2.WebView.New(panel)
+
+            # Set home URL (Google Scholar search page)
+            self.estr_home_url = "https://scholar.google.com/"
+
+            # Deferred loading: show placeholder HTML until delay expires
+            delay_sec = self.scholar_load_delay
+            if delay_sec > 0:
+                placeholder_html = (
+                    f"<html><body style='font-family:sans-serif; padding:40px; color:#555;'>"
+                    f"<h2>&#128336; Loading paused</h2>"
+                    f"<p>The <b>Good paper Scholar</b> tab will automatically load Google Scholar "
+                    f"in <b>{delay_sec} second{'s' if delay_sec != 1 else ''}</b>.</p>"
+                    f"<p>You can also click <b>Home</b> or <b>Search</b> to load it immediately.</p>"
+                    f"</body></html>"
+                )
+                self.estr_web_view.SetPage(placeholder_html, "")
+                wx.CallLater(delay_sec * 1000, self._estr_deferred_load)
+            else:
+                self.estr_web_view.LoadURL(self.estr_home_url)
+
+            # Add loading indicator
+            estr_loading_text = wx.StaticText(panel, label="Ready to search electronic structure papers...")
+            estr_loading_text.SetForegroundColour(wx.Colour(100, 100, 100))
+
+            # Bind events to handle loading
+            self.estr_web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, self.on_estr_page_loaded)
+            self.estr_web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, self.on_estr_page_error)
+            self.estr_web_view.Bind(wx.html2.EVT_WEBVIEW_NAVIGATING, self.on_estr_navigating)
+            self.estr_web_view.Bind(wx.html2.EVT_WEBVIEW_NEWWINDOW, self.on_estr_new_window)
+
+            sizer.Add(search_panel, 0, wx.ALL | wx.EXPAND, 0)
+            sizer.Add(nav_panel, 0, wx.ALL | wx.EXPAND, 0)
+            # sizer.Add(estr_loading_text, 0, wx.ALL | wx.EXPAND, 5)
+            sizer.Add(self.estr_web_view, 1, wx.ALL | wx.EXPAND, 0)
+
+            # Store reference to loading text
+            self.estr_loading_text = estr_loading_text
+
+        except Exception as e:
+            # Fallback if WebView is not available
+            error_text = wx.StaticText(panel,
+                                       label="Web browser not available.\n\nPlease visit Google Scholar directly:\nhttps://scholar.google.com/")
+            error_text.Wrap(400)
+            sizer.Add(error_text, 1, wx.ALL | wx.EXPAND, 20)
+
+        panel.SetSizer(sizer)
+        notebook.AddPage(panel, "Good paper Scholar")
+
+    def _harwell_deferred_load(self):
+        """Called by wx.CallLater to load the Harwell XPS Guru tab after 10 seconds."""
+        try:
+            if hasattr(self, 'harwell_web_view') and self.harwell_web_view:
+                self.harwell_web_view.LoadURL(self.harwell_url)
+        except Exception:
+            pass
+
+    def _sss_deferred_load(self):
+        """Called by wx.CallLater to load the SSS Scholar tab after the configured delay."""
+        try:
+            if hasattr(self, 'sss_web_view') and self.sss_web_view:
+                self.sss_web_view.LoadURL(self.sss_home_url)
+        except Exception:
+            pass
+
+    def _estr_deferred_load(self):
+        """Called by wx.CallLater to load the Good paper Scholar tab after the configured delay."""
+        try:
+            if hasattr(self, 'estr_web_view') and self.estr_web_view:
+                self.estr_web_view.LoadURL(self.estr_home_url)
+        except Exception:
+            pass
+
+    def on_estr_search(self, event):
+        """Perform Electronic Structure search on Google Scholar"""
+        try:
+            search_terms = self.estr_search_ctrl.GetValue().strip()
+            if not search_terms:
+                return
+
+            # Build the search query with "electronic structure" always included
+            import urllib.parse
+            query = f'electronic structure {search_terms}'
+            encoded_query = urllib.parse.quote(query)
+
+            # Build URL with optional high citations sorting
+            if self.estr_high_citations_cb.GetValue():
+                # Default Google Scholar sort (by relevance/citations) - no extra parameters
+                # This naturally shows highly-cited papers first
+                search_url = f"https://scholar.google.com/scholar?q={encoded_query}"
+            else:
+                # Sort by date to show newest papers when high citations not requested
+                search_url = f"https://scholar.google.com/scholar?q={encoded_query}&scisbd=1"
+
+            self.estr_loading_text.SetLabel(f"Searching for: electronic structure {search_terms}")
+            self.estr_loading_text.Show()
+            self.estr_web_view.LoadURL(search_url)
+        except Exception as e:
+            wx.MessageBox(f"Search failed: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+
+
+    def on_estr_back(self, event):
+        """Navigate back in E-Structure web view"""
+        try:
+            if self.estr_web_view.CanGoBack():
+                self.estr_web_view.GoBack()
+        except:
+            pass
+
+
+    def on_estr_forward(self, event):
+        """Navigate forward in E-Structure web view"""
+        try:
+            if self.estr_web_view.CanGoForward():
+                self.estr_web_view.GoForward()
+        except:
+            pass
+
+
+    def on_estr_home(self, event):
+        """Go to home page (Google Scholar)"""
+        try:
+            self.estr_loading_text.SetLabel("Loading Google Scholar...")
+            self.estr_loading_text.Show()
+            self.estr_web_view.LoadURL(self.estr_home_url)
+        except:
+            pass
+
+
+    def on_estr_refresh(self, event):
+        """Refresh the E-Structure page"""
+        try:
+            self.estr_loading_text.SetLabel("Refreshing page...")
+            self.estr_loading_text.Show()
+            self.estr_web_view.Reload()
+        except:
+            pass
+
+    def on_estr_zoom_in(self, event):
+        """Zoom in the E-Structure web view"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.estr_web_view.RunScript(script)
+        except:
+            pass
+
+    def on_estr_zoom_out(self, event):
+        """Zoom out the E-Structure web view"""
+        try:
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
+            """
+            self.estr_web_view.RunScript(script)
+        except:
+            pass
+
+
+    def on_estr_page_loaded(self, event):
+        """Handle successful E-Structure page loading"""
+        try:
+            self.estr_loading_text.Hide()
+            self.Layout()
+        except:
+            pass
+
+
+    def on_estr_page_error(self, event):
+        """Handle E-Structure page loading errors"""
+        try:
+            self.estr_loading_text.SetLabel("Failed to load webpage. Please check your internet connection.")
+            self.estr_loading_text.SetForegroundColour(wx.Colour(200, 0, 0))
+        except:
+            pass
+
+
+    def on_estr_navigating(self, event):
+        """Handle navigation events to intercept downloads"""
+        url = event.GetURL()
+
+        # Check if this looks like a file download
+        download_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.csv', '.txt']
+
+        if any(url.lower().endswith(ext) for ext in download_extensions):
+            event.Veto()  # Prevent web view from handling it
+            self.download_file(url)
+        else:
+            event.Skip()  # Allow normal navigation
+
+
+    def on_estr_new_window(self, event):
+        """Handle new window requests (often used for downloads)"""
+        url = event.GetURL()
+
+        # Check if this is a download link
+        download_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.zip', '.rar', '.csv', '.txt']
+
+        if any(url.lower().endswith(ext) for ext in download_extensions):
+            event.Veto()  # Don't open new window
+            self.download_file(url)
+        else:
+            # For non-download links, load in current view
+            event.Veto()
+            self.estr_web_view.LoadURL(url)
+
+    def create_useful_pdf_tab(self, notebook):
+        """Create Useful PDF tab with 6 sub-tabs for PDF links with embedded browsers"""
+        panel = wx.Panel(notebook)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Create sub-notebook for PDF links
+        pdf_notebook = wx.Notebook(panel, style=wx.NB_DEFAULT)
+
+        # Define PDF links
+        pdf_links = [
+            {
+                'title': 'Multiplet Splitting',
+                'description': 'Explanation of the Multiplet splitting',
+                'url': 'https://analyticalsciencejournals.onlinelibrary.wiley.com/doi/epdf/10.1002/sia.7383',
+                'attr': 'multiplet_web_view'
+            },
+            {
+                'title': 'Coster-Kronig Effect',
+                'description': 'Explanation of the Coster-Kronig effect',
+                'url': 'https://analyticalsciencejournals.onlinelibrary.wiley.com/doi/epdf/10.1002/sia.7410',
+                'attr': 'coster_web_view'
+            },
+            {
+                'title': 'D-Parameter',
+                'description': 'Measuring the D-parameter',
+                'url': 'https://www.mdpi.com/2311-5629/7/3/51',
+                'attr': 'd_param_web_view'
+            },
+            {
+                'title': 'C1s Peak Fitting',
+                'description': 'Fitting of the C1s Peak',
+                'url': 'https://drive.google.com/file/d/1fyXNfX46cN7q2sYRqwBM-jaj7C2cNSPA/view',
+                'attr': 'c1s_web_view'
+            },
+            {
+                'title': 'Cr/Mn/Fe/Co/Ni',
+                'description': 'Fitting Transition Metal Cr/Mn/Fe/Co/Ni',
+                'url': 'https://drive.google.com/file/d/1Kxx_j2kCpj8Hrd3XwbmEcJ16qHpgDmuN/view',
+                'attr': 'crmnfe_web_view'
+            },
+            {
+                'title': 'Cu/Ti/V/Sc/Zn',
+                'description': 'Fitting Transition Metal Cu/Ti/V/Sc/Zn',
+                'url': 'https://drive.google.com/file/d/1YYw7O1JVW4Ni_3GJv72uTE9KVE4Cg1S9/view',
+                'attr': 'cutiv_web_view'
+            }
+        ]
+
+        # Create a sub-tab for each PDF link
+        for pdf_info in pdf_links:
+            sub_panel = wx.Panel(pdf_notebook)
+            sub_sizer = wx.BoxSizer(wx.VERTICAL)
+
+            try:
+                # Create toolbar with refresh and zoom buttons
+                toolbar_panel = wx.Panel(sub_panel)
+                toolbar_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+                refresh_btn = wx.Button(toolbar_panel, label="Refresh")
+                refresh_btn.Bind(wx.EVT_BUTTON, lambda evt, attr=pdf_info['attr']: self.on_pdf_refresh(evt, attr))
+
+                zoom_in_btn = wx.Button(toolbar_panel, label="+", size=(30, -1))
+                zoom_in_btn.Bind(wx.EVT_BUTTON, lambda evt, attr=pdf_info['attr']: self.on_pdf_zoom_in(evt, attr))
+
+                zoom_out_btn = wx.Button(toolbar_panel, label="-", size=(30, -1))
+                zoom_out_btn.Bind(wx.EVT_BUTTON, lambda evt, attr=pdf_info['attr']: self.on_pdf_zoom_out(evt, attr))
+
+                url_label = wx.StaticText(toolbar_panel, label=pdf_info['description'])
+                font = url_label.GetFont()
+                font.SetWeight(wx.FONTWEIGHT_BOLD)
+                url_label.SetFont(font)
+
+                toolbar_sizer.Add(url_label, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+                toolbar_sizer.Add(zoom_out_btn, 0, wx.ALL, 2)
+                toolbar_sizer.Add(zoom_in_btn, 0, wx.ALL, 2)
+                toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 2)
+                toolbar_panel.SetSizer(toolbar_sizer)
+
+                # Create web view control
+                web_view = wx.html2.WebView.New(sub_panel)
+                setattr(self, pdf_info['attr'], web_view)
+
+                # Load the webpage
+                web_view.LoadURL(pdf_info['url'])
+
+                # Add loading indicator
+                loading_text = wx.StaticText(sub_panel, label=f"Loading {pdf_info['title']}...")
+                loading_text.SetForegroundColour(wx.Colour(100, 100, 100))
+                loading_attr = pdf_info['attr'].replace('_web_view', '_loading_text')
+                setattr(self, loading_attr, loading_text)
+
+                # Bind events to handle loading
+                web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED, lambda evt, attr=loading_attr: self.on_pdf_page_loaded(evt, attr))
+                web_view.Bind(wx.html2.EVT_WEBVIEW_ERROR, lambda evt, attr=loading_attr: self.on_pdf_page_error(evt, attr))
+
+                sub_sizer.Add(toolbar_panel, 0, wx.ALL | wx.EXPAND, 0)
+                sub_sizer.Add(web_view, 1, wx.ALL | wx.EXPAND, 0)
+
+            except Exception as e:
+                # Fallback if WebView is not available
+                error_text = wx.StaticText(sub_panel,
+                                           label=f"Web browser not available.\n\nPlease visit:\n{pdf_info['url']}")
+                error_text.Wrap(400)
+                sub_sizer.Add(error_text, 1, wx.ALL | wx.EXPAND, 20)
+
+            sub_panel.SetSizer(sub_sizer)
+            pdf_notebook.AddPage(sub_panel, pdf_info['title'])
+
+        main_sizer.Add(pdf_notebook, 1, wx.ALL | wx.EXPAND, 5)
+        panel.SetSizer(main_sizer)
+        notebook.AddPage(panel, "Useful PDF")
+
+    def on_pdf_refresh(self, event, web_view_attr):
+        """Refresh a PDF web view"""
+        try:
+            web_view = getattr(self, web_view_attr)
+            loading_attr = web_view_attr.replace('_web_view', '_loading_text')
+            loading_text = getattr(self, loading_attr)
+            loading_text.SetLabel("Refreshing page...")
+            loading_text.Show()
+            web_view.Reload()
+        except:
+            pass
+
+    def on_pdf_zoom_in(self, event, web_view_attr):
+        """Zoom in a PDF web view using JavaScript"""
+        try:
+            web_view = getattr(self, web_view_attr)
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        document.body.style.zoom = (currentZoom * 1.1).toString();
+                    }
+                } catch(e) {}
+            })();
+            """
+            web_view.RunScript(script)
+        except:
+            pass
+
+    def on_pdf_zoom_out(self, event, web_view_attr):
+        """Zoom out a PDF web view using JavaScript"""
+        try:
+            web_view = getattr(self, web_view_attr)
+            script = """
+            (function() {
+                try {
+                    if (document && document.body && document.body.style) {
+                        var currentZoom = parseFloat(document.body.style.zoom || '1');
+                        if (currentZoom > 0.5) {
+                            document.body.style.zoom = (currentZoom / 1.1).toString();
+                        }
+                    }
+                } catch(e) {}
+            })();
+            """
+            web_view.RunScript(script)
+        except:
+            pass
+
+    def on_pdf_page_loaded(self, event, loading_text_attr):
+        """Handle successful PDF page loading"""
+        try:
+            loading_text = getattr(self, loading_text_attr)
+            loading_text.Hide()
+            self.Layout()
+        except:
+            pass
+
+    def on_pdf_page_error(self, event, loading_text_attr):
+        """Handle PDF page loading errors"""
+        try:
+            loading_text = getattr(self, loading_text_attr)
+            loading_text.SetLabel("Failed to load webpage. Please check your internet connection.")
+            loading_text.SetForegroundColour(wx.Colour(200, 0, 0))
+        except:
+            pass
 
 class ElementTile(wx.Panel):
     """Custom widget for periodic table element tiles"""
 
-    def __init__(self, parent, element, color, enabled=True, atomic_number=None, core_level=None, binding_energy=None):
-        super().__init__(parent, size=(37, 37))
-        if 'wxGTK' in wx.PlatformInfo:
-            self.SetMinSize(wx.Size(41, 41))
-        else:
-            self.SetMinSize(wx.Size(37, 37))
+    def __init__(self, parent, element, color, enabled=True, atomic_number=None, core_level=None, binding_energy=None, compact=False, mini=False):
+        self.compact = compact
+        self.mini = mini
+        size = self._tile_pixels()
+        super().__init__(parent, size=(size, size))
+        self._apply_min_size(size)
         self.element = element
         self.color = color
         self.enabled = enabled
@@ -3519,6 +4989,68 @@ class ElementTile(wx.Panel):
         self.binding_energy = binding_energy or 'N.D.'
         self.hover = False
         self.pressed = False
+        self.simplified = False  # Set by refresh_periodic_table from config
+
+        self._is_macos = platform.system() == 'Darwin'
+        self._build_fonts()
+
+        # Bind paint and mouse events
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_LEFT_DOWN, self.on_mouse_down)
+        self.Bind(wx.EVT_LEFT_UP, self.on_mouse_up)
+        self.Bind(wx.EVT_LEFT_DCLICK, self.on_double_click)
+        self.Bind(wx.EVT_ENTER_WINDOW, self.on_enter)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self.on_leave)
+        self.Bind(wx.EVT_MOTION, self.on_motion)
+
+        self.click_callback = None
+        self.double_click_callback = None
+
+    def _tile_pixels(self):
+        if self.mini:
+            return 24
+        return 34 if self.compact else 37
+
+    def _apply_min_size(self, size):
+        if 'wxGTK' in wx.PlatformInfo and not self.mini:
+            self.SetMinSize(wx.Size(size + 4, size + 4))
+        else:
+            self.SetMinSize(wx.Size(size, size))
+
+    def _build_fonts(self):
+        if self.mini:
+            if getattr(self, '_is_macos', platform.system() == 'Darwin'):
+                elem_pt = 11
+            else:
+                elem_pt = 9
+            self._small_font = wx.Font(6, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+            self._element_font = wx.Font(elem_pt, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+            self._core_y_offset = 0
+            return
+        if self._is_macos:
+            small_pt = 8 if self.compact else 9
+            elem_pt = 13 if self.compact else 14
+            self._small_font = wx.Font(small_pt, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+            self._element_font = wx.Font(elem_pt, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+            self._core_y_offset = 2
+        else:
+            elem_pt = 10 if self.compact else 11
+            self._small_font = wx.Font(7, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
+                                       faceName="Segoe UI")
+            self._element_font = wx.Font(elem_pt, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD,
+                                         faceName="Segoe UI")
+            self._core_y_offset = 0
+
+    def set_mini(self, mini):
+        """Switch between mini (20×20, symbol-only) and the standard size."""
+        if self.mini == bool(mini):
+            return
+        self.mini = bool(mini)
+        size = self._tile_pixels()
+        self._apply_min_size(size)
+        self.SetSize((size, size))
+        self._build_fonts()
+        self.Refresh()
 
         # Bind paint and mouse events
         self.Bind(wx.EVT_PAINT, self.on_paint)
@@ -3537,9 +5069,32 @@ class ElementTile(wx.Panel):
         """Draw the element tile with atomic number, element symbol, core level, and binding energy"""
         dc = wx.PaintDC(self)
         gc = wx.GraphicsContext.Create(dc)
-
         width, height = self.GetSize()
 
+        # ── Simplified mode: plain bg, element symbol only ────────────────────
+        if self.simplified:
+            external_color = wx.Colour(self.color) if isinstance(self.color, str) else self.color
+            r, g, b = external_color.Red(), external_color.Green(), external_color.Blue()
+            is_legacy_green = (r == 0 and g == 255 and b == 0)
+            is_brand_green = (r == 79 and g == 190 and b == 159)
+            if not self.enabled:
+                bg = wx.Colour(220, 220, 220)
+            elif is_brand_green or is_legacy_green:
+                bg = wx.Colour(79, 190, 159)
+            elif self.hover:
+                bg = wx.Colour(210, 210, 210)
+            else:
+                bg = wx.Colour(245, 245, 245)
+            gc.SetPen(wx.Pen(wx.Colour(160, 160, 160), 1))
+            gc.SetBrush(wx.Brush(bg))
+            gc.DrawRoundedRectangle(0, 0, width - 1, height - 1, 2)
+            text_color = wx.BLACK if self.enabled else wx.Colour(160, 160, 160)
+            gc.SetFont(self._element_font, text_color)
+            tw, th = gc.GetTextExtent(self.element)
+            gc.DrawText(self.element, (width - tw) / 2, (height - th) / 2)
+            return
+
+        # ── Full mode (default) ───────────────────────────────────────────────
         # Determine the actual color to use (existing color logic)
         if not self.enabled:
             base_color = wx.Colour(self.color)
@@ -3570,23 +5125,17 @@ class ElementTile(wx.Panel):
         gc.SetBrush(wx.Brush(actual_color))
         gc.DrawRoundedRectangle(0, 0, width - 1, height - 1, 2)
 
-        # Set up fonts and colors - PLATFORM SPECIFIC
+        # Use pre-cached fonts and platform flag (computed once in __init__)
         text_color = wx.BLACK if self.enabled else wx.Colour(136, 136, 136)
+        small_font = self._small_font
+        element_font = self._element_font
 
-        import platform
-        if platform.system() == 'Darwin':  # macOS
-            small_font_size = 9
-            element_font_size = 14
-            small_font = wx.Font(small_font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
-            element_font = wx.Font(element_font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
-        else:  # Windows and other systems
-            small_font_size = 7
-            element_font_size = 11
-            # Use Segoe UI which is clearer on Windows
-            small_font = wx.Font(small_font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL,
-                                 faceName="Segoe UI")
-            element_font = wx.Font(element_font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD,
-                                   faceName="Segoe UI")
+        # Mini (colored, symbol only) — skip atomic#, BE, core level
+        if self.mini:
+            gc.SetFont(element_font, text_color)
+            tw, th = gc.GetTextExtent(self.element)
+            gc.DrawText(self.element, (width - tw) / 2, (height - th) / 2)
+            return
 
         # 1. Draw atomic number in top-left corner
         if self.atomic_number and self.atomic_number > 0:
@@ -3617,22 +5166,14 @@ class ElementTile(wx.Panel):
             gc.SetFont(small_font, text_color)
             core_width, core_height = gc.GetTextExtent(self.core_level)
             core_x = (width - core_width) / 2
-            import platform
-            if platform.system() == 'Darwin':  # macOS
-                core_y = element_y + element_height + 2  # Below the element symbol
-            else:
-                core_y = element_y + element_height + 0
+            core_y = element_y + element_height + self._core_y_offset
             gc.DrawText(self.core_level, core_x, core_y)
         elif self.core_level == 'N.D.':
             # Show N.D. for elements with no data
             gc.SetFont(small_font, text_color)
             core_width, core_height = gc.GetTextExtent('N.D.')
             core_x = (width - core_width) / 2
-            import platform
-            if platform.system() == 'Darwin':  # macOS
-                core_y = element_y + element_height + 2  # Below the element symbol
-            else:
-                core_y = element_y + element_height + 0
+            core_y = element_y + element_height + self._core_y_offset
             gc.DrawText('N.D.', core_x, core_y)
 
     def on_mouse_down(self, event):
@@ -3682,6 +5223,44 @@ class ElementTile(wx.Panel):
     def set_double_click_callback(self, callback):
         """Set the double-click callback"""
         self.double_click_callback = callback
+
+    def Destroy(self):
+        """Override Destroy to properly clean up web views"""
+        try:
+            # Stop loading and clear web views before destroying
+            if hasattr(self, 'xps_web_view'):
+                try:
+                    self.xps_web_view.Stop()
+                except:
+                    pass
+
+            if hasattr(self, 'web_view'):
+                try:
+                    self.web_view.Stop()
+                except:
+                    pass
+
+            if hasattr(self, 'harwell_web_view'):
+                try:
+                    self.harwell_web_view.Stop()
+                except:
+                    pass
+
+            if hasattr(self, 'sss_web_view'):
+                try:
+                    self.sss_web_view.Stop()
+                except:
+                    pass
+
+            if hasattr(self, 'estr_web_view'):
+                try:
+                    self.estr_web_view.Stop()
+                except:
+                    pass
+        except:
+            pass
+
+        return super().Destroy()
 
 def main():
     app = wx.App()
