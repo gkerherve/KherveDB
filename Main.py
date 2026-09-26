@@ -21,11 +21,28 @@ import platform
 import wx.html2
 
 
+def resource_dirs():
+    """Folders where bundled resources may live (PyInstaller 6 uses _internal/ = sys._MEIPASS)."""
+    dirs = []
+    if hasattr(sys, '_MEIPASS'):
+        dirs.append(sys._MEIPASS)
+    if getattr(sys, 'frozen', False):
+        dirs.append(os.path.dirname(sys.executable))
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return dirs
+
+
+def resource_path(*parts):
+    """Return the first existing path to a bundled resource, or the first candidate."""
+    candidates = [os.path.join(d, *parts) for d in resource_dirs()]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
+
 # Standalone icon helper (replaces libraries.Utilities.set_app_icon)
-if getattr(sys, 'frozen', False):
-    _ICON_PATH = os.path.join(os.path.dirname(sys.executable), "Icons", "Icon.ico")
-else:
-    _ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Icons", "Icon.ico")
+_ICON_PATH = resource_path("Icons", "Icon.ico")
 
 
 def set_app_icon(frame):
@@ -333,21 +350,17 @@ Version: 4.0"""
 
     def load_data(self):
         """Load XPS data from file"""
-        if getattr(sys, 'frozen', False):
-            base_path = os.path.dirname(sys.executable)
-        else:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-
-        possible_paths = [
-            os.path.join(base_path, "NIST_BE.parquet"),
-            os.path.join(base_path, "libraries", "NIST_BE.parquet"),
-            os.path.join(base_path, "..", "Resources", "NIST_BE.parquet"),  # Mac app bundle
-            os.path.join(base_path, "NIST_BE.xlsx"),
-            os.path.join(base_path, "libraries", "NIST_BE.xlsx"),
-            os.path.join(base_path, "..", "Resources", "NIST_BE.xlsx")  # Mac app bundle
-        ]
+        possible_paths = []
+        for ext in ("parquet", "xlsx"):
+            for base_path in resource_dirs():
+                possible_paths += [
+                    os.path.join(base_path, f"NIST_BE.{ext}"),
+                    os.path.join(base_path, "libraries", f"NIST_BE.{ext}"),
+                    os.path.join(base_path, "..", "Resources", f"NIST_BE.{ext}"),  # Mac app bundle
+                ]
 
         data_found = False
+        errors = []
         for data_path in possible_paths:
             if os.path.exists(data_path):
                 try:
@@ -363,10 +376,12 @@ Version: 4.0"""
                     data_found = True
                     break
                 except Exception as e:
+                    errors.append(f"{data_path}: {e}")
                     continue
 
         if not data_found:
-            wx.MessageBox("Failed to load data: NIST_BE file not found",
+            detail = "\n".join(errors) if errors else "Searched:\n" + "\n".join(possible_paths)
+            wx.MessageBox("Failed to load data: NIST_BE file not found or unreadable\n\n" + detail,
                           "Error", wx.OK | wx.ICON_ERROR)
             self.Close()
 
@@ -5262,10 +5277,45 @@ class ElementTile(wx.Panel):
 
         return super().Destroy()
 
+def show_welcome(frame):
+    """Show the welcome dialog unless the user disabled it."""
+    if not frame.config.get('show_welcome', True):
+        return
+    dlg = wx.Dialog(frame, title="Welcome to KherveDB")
+    sizer = wx.BoxSizer(wx.VERTICAL)
+    img_path = resource_path("Icons", "Welcome.png")
+    if os.path.exists(img_path):
+        sizer.Add(wx.StaticBitmap(dlg, bitmap=wx.Bitmap(img_path, wx.BITMAP_TYPE_PNG)), 0, wx.ALL, 0)
+    text = ("Click an element in the periodic table to browse its XPS binding energies\n"
+            "from the NIST database, compare core levels and find reference literature.")
+    sizer.Add(wx.StaticText(dlg, label=text), 0, wx.ALL, 15)
+    cb = wx.CheckBox(dlg, label="Don't show this again")
+    sizer.Add(cb, 0, wx.LEFT | wx.RIGHT, 15)
+    sizer.Add(dlg.CreateButtonSizer(wx.OK), 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+    dlg.SetSizerAndFit(sizer)
+    dlg.CentreOnParent()
+    dlg.ShowModal()
+    if cb.GetValue():
+        frame.config['show_welcome'] = False
+        frame.save_config()
+    dlg.Destroy()
+
+
 def main():
     app = wx.App()
+    splash = None
+    splash_path = resource_path("Icons", "Splash.png")
+    if os.path.exists(splash_path):
+        import wx.adv
+        splash = wx.adv.SplashScreen(wx.Bitmap(splash_path, wx.BITMAP_TYPE_PNG),
+                                     wx.adv.SPLASH_CENTRE_ON_SCREEN | wx.adv.SPLASH_NO_TIMEOUT,
+                                     0, None)
+        wx.SafeYield()
     frame = PeriodicTableXPS()
+    if splash:
+        splash.Destroy()
     frame.Show()
+    wx.CallAfter(show_welcome, frame)
     app.MainLoop()
 
 
