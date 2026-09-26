@@ -5306,7 +5306,6 @@ def main():
     splash = None
     splash_path = resource_path("Icons", "Splash.png")
     if os.path.exists(splash_path):
-        import wx.adv
         splash = wx.adv.SplashScreen(wx.Bitmap(splash_path, wx.BITMAP_TYPE_PNG),
                                      wx.adv.SPLASH_CENTRE_ON_SCREEN | wx.adv.SPLASH_NO_TIMEOUT,
                                      0, None)
