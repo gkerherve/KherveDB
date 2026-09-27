@@ -759,9 +759,39 @@ Version: {APP_VERSION}"""
         # Set callbacks
         tile.set_click_callback(self.select_element)
         tile.set_double_click_callback(self.on_element_double_click)
-        tile.SetToolTip(self.build_element_tooltip(element))
+        tile.SetToolTip(f"{element}: click to show NIST entries, double-click for Other Databases & Properties,\n"
+                        f"right-click for electronic structure, XPS peak positions and overlaps")
+        tile.Bind(wx.EVT_RIGHT_UP, lambda evt, el=element: self.show_element_info(el))
 
         return tile
+
+    def show_element_info(self, element):
+        """Small window with electronic structure, XPS peaks and overlaps; reused between elements."""
+        text = self.build_element_tooltip(element)
+        text = text.replace("\n\nClick: show NIST entries  -  Double-click: Other Databases & Properties", "")
+        win = getattr(self, "_info_window", None)
+        if not win:
+            win = wx.Frame(self, style=wx.CAPTION | wx.CLOSE_BOX | wx.FRAME_TOOL_WINDOW
+                           | wx.FRAME_FLOAT_ON_PARENT | wx.RESIZE_BORDER)
+            win.SetBackgroundColour(wx.Colour(255, 255, 240))
+            win._label = wx.StaticText(win)
+            win._label.SetFont(wx.Font(9, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            sizer.Add(win._label, 1, wx.ALL | wx.EXPAND, 10)
+            win.SetSizer(sizer)
+            win.Bind(wx.EVT_CHAR_HOOK, lambda e: win.Close() if e.GetKeyCode() == wx.WXK_ESCAPE else e.Skip())
+            win.Bind(wx.EVT_CLOSE, lambda e: (setattr(self, "_info_window", None), win.Destroy()))
+            self._info_window = win
+        win.SetTitle(f"{element} - XPS information")
+        win._label.SetLabel(text)
+        win.Fit()
+        # Open next to the mouse, kept on screen
+        x, y = wx.GetMousePosition()
+        area = wx.Display(max(0, wx.Display.GetFromPoint((x, y)))).GetClientArea()
+        w, h = win.GetSize()
+        win.SetPosition((min(x + 15, area.GetRight() - w), min(y + 15, area.GetBottom() - h)))
+        win.Show()
+        win.Raise()
 
     _SPIN_ORBIT_PAIRS = [("2p3/2", "2p1/2"), ("3p3/2", "3p1/2"), ("4p3/2", "4p1/2"), ("5p3/2", "5p1/2"),
                          ("3d5/2", "3d3/2"), ("4d5/2", "4d3/2"), ("5d5/2", "5d3/2"), ("4f7/2", "4f5/2")]
@@ -5716,7 +5746,9 @@ def show_welcome(frame):
     if os.path.exists(img_path):
         sizer.Add(wx.StaticBitmap(dlg, bitmap=wx.Bitmap(img_path, wx.BITMAP_TYPE_PNG)), 0, wx.ALL, 0)
     text = ("Click an element in the periodic table to browse its XPS binding energies\n"
-            "from the NIST database, compare core levels and find reference literature.")
+            "from the NIST database, compare core levels and find reference literature.\n"
+            "Right-click an element for its electronic structure, XPS peak positions and overlaps;\n"
+            "double-click it to open Other Databases & Properties.")
     sizer.Add(wx.StaticText(dlg, label=text), 0, wx.ALL, 15)
     cb = wx.CheckBox(dlg, label="Don't show this again")
     sizer.Add(cb, 0, wx.LEFT | wx.RIGHT, 15)
