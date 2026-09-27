@@ -41,23 +41,143 @@ def resource_path(*parts):
     return candidates[0]
 
 
+APP_VERSION = "4.0"
+GITHUB_REPO = "gkerherve/KherveDB"
+
+
+def _version_tuple(v):
+    """'v4.10' -> (4, 10) for comparison."""
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def fetch_latest_release():
+    """Return (version, installer_url, notes) of the latest GitHub release, or None."""
+    import json, urllib.request
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": "KherveDB-Updater"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.load(r)
+    assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+    url = assets.get("KherveDB_Installer.exe") or next(
+        (u for n, u in assets.items() if n.lower().endswith(".exe")), None)
+    return data.get("tag_name", ""), url, data.get("body") or ""
+
+
+def check_for_updates(frame, silent=True):
+    """Check GitHub in a background thread; offer to download and run the new installer.
+
+    silent=True (startup) only speaks up when an update exists; the menu item reports every outcome.
+    """
+    import threading
+
+    def worker():
+        try:
+            result = fetch_latest_release()
+        except Exception as e:
+            result = e
+        wx.CallAfter(on_result, result)
+
+    def on_result(result):
+        if not frame or not frame.IsShown():
+            return
+        if isinstance(result, Exception):
+            if not silent:
+                wx.MessageBox(f"Could not check for updates:\n{result}", "KherveDB Update", wx.OK | wx.ICON_WARNING)
+            return
+        tag, url, notes = result
+        if not tag or _version_tuple(tag) <= _version_tuple(APP_VERSION):
+            if not silent:
+                wx.MessageBox(f"You have the latest version ({APP_VERSION}).", "KherveDB Update", wx.OK | wx.ICON_INFORMATION)
+            return
+        if silent and frame.config.get("skip_update_version") == tag:
+            return
+        msg = f"A new version of KherveDB is available: {tag} (you have {APP_VERSION}).\n\n"
+        if notes:
+            msg += notes[:600] + "\n\n"
+        if not url or sys.platform != "win32":
+            wx.MessageBox(msg + f"Download it from:\nhttps://github.com/{GITHUB_REPO}/releases/latest",
+                          "KherveDB Update", wx.OK | wx.ICON_INFORMATION)
+            return
+        dlg = wx.MessageDialog(frame, msg + "Download and install it now?", "KherveDB Update",
+                               wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+        dlg.SetYesNoCancelLabels("Install now", "Skip this version", "Later")
+        answer = dlg.ShowModal()
+        dlg.Destroy()
+        if answer == wx.ID_YES:
+            download_and_install(frame, url, tag)
+        elif answer == wx.ID_NO:
+            frame.config["skip_update_version"] = tag
+            frame.save_config()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def download_and_install(frame, url, tag):
+    """Download the installer with a progress dialog, launch it and close KherveDB."""
+    import tempfile, urllib.request
+    dest = os.path.join(tempfile.gettempdir(), f"KherveDB_Installer_{tag}.exe")
+    progress = wx.ProgressDialog("KherveDB Update", f"Downloading KherveDB {tag}...", 100, frame,
+                                 wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_AUTO_HIDE)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "KherveDB-Updater"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                pct = min(99, int(done * 100 / total)) if total else 50
+                if not progress.Update(pct, f"Downloading KherveDB {tag}... {done // (1 << 20)} MB")[0]:
+                    progress.Destroy()
+                    return
+        progress.Update(100)
+        progress.Destroy()
+    except Exception as e:
+        progress.Destroy()
+        wx.MessageBox(f"Download failed:\n{e}", "KherveDB Update", wx.OK | wx.ICON_ERROR)
+        return
+
+    # Install over the current folder when running the packaged app (NSIS /D must be last, unquoted)
+    params = f"/D={os.path.dirname(sys.executable)}" if getattr(sys, 'frozen', False) else ""
+    try:
+        os.startfile(dest, "runas", params)
+    except Exception as e:
+        wx.MessageBox(f"Could not start the installer:\n{e}\n\nIt was saved to:\n{dest}",
+                      "KherveDB Update", wx.OK | wx.ICON_ERROR)
+        return
+    frame.Close()
+
+
 # Injected into every page: declines cookie banners (reject / necessary only) and hides leftovers
 _COOKIE_SCRIPT = r"""
 (function() {
-    var REJECT = /^(reject all|reject|reject all cookies|decline|decline all|refuse|refuse all|deny|only necessary|necessary only|use necessary cookies only|allow necessary cookies only|essential cookies only|only essential cookies|continue without accepting|tout refuser|refuser)$/i;
-    var IDS = ['onetrust-reject-all-handler', 'CybotCookiebotDialogBodyButtonDecline', 'truste-consent-required'];
+    var REJECT = /^(reject all|reject|reject all cookies|reject non-essential|reject non-essential cookies|reject optional cookies|deny all|decline|decline all|refuse|refuse all|deny|only necessary|necessary only|use necessary cookies only|allow necessary cookies only|essential cookies only|only essential cookies|continue without accepting|tout refuser|refuser)$/i;
+    var IDS = ['onetrust-reject-all-handler', 'CybotCookiebotDialogBodyButtonDecline', 'truste-consent-required',
+               'cookieChoiceDismiss'];  // Blogger notice has only 'Got it'
+    var SEL = '[data-testid=uc-deny-all-button], button[data-action=deny], .cmpboxbtnno';
     var HIDE = '#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter,#CybotCookiebotDialog,' +
-               '.cc-window,.cookie-banner,#cookie-banner,.cookie-notice,#cookie-notice,.cmp-container,#truste-consent-track';
+               '#usercentrics-root,#cookieChoiceInfo,.cc-window,.cookie-banner,#cookie-banner,.cookie-notice,#cookie-notice,.cmp-container,#truste-consent-track';
     function run() {
         try {
             for (var i = 0; i < IDS.length; i++) {
                 var b = document.getElementById(IDS[i]);
                 if (b && b.offsetParent !== null) { b.click(); return true; }
             }
-            var els = document.querySelectorAll('button, [role=button], input[type=button], input[type=submit], a');
-            for (var j = 0; j < els.length; j++) {
-                var t = (els[j].innerText || els[j].value || '').trim().replace(/\s+/g, ' ');
-                if (t.length < 50 && REJECT.test(t) && els[j].offsetParent !== null) { els[j].click(); return true; }
+            // Search the page and any shadow roots (e.g. Usercentrics)
+            var roots = [document];
+            document.querySelectorAll('*').forEach(function(e) { if (e.shadowRoot) roots.push(e.shadowRoot); });
+            for (var r = 0; r < roots.length; r++) {
+                var d = roots[r].querySelector(SEL);
+                if (d) { d.click(); return true; }
+                var els = roots[r].querySelectorAll('button, [role=button], input[type=button], input[type=submit], a');
+                for (var j = 0; j < els.length; j++) {
+                    var t = (els[j].innerText || els[j].value || '').trim().replace(/\s+/g, ' ');
+                    if (t.length < 50 && REJECT.test(t) && els[j].getClientRects().length) { els[j].click(); return true; }
+                }
             }
         } catch (e) {}
         return false;
@@ -71,10 +191,19 @@ _COOKIE_SCRIPT = r"""
             document.head.appendChild(s);
         } catch (e) {}
     }
+    // Banners with no reject button (TrustArc) are hidden straight away
+    function hideNow() {
+        if (!document.head) { setTimeout(hideNow, 50); return; }
+        var s = document.createElement('style');
+        s.textContent = '#truste-consent-track,.truste_overlay,.truste_box_overlay,#truste-consent-content' +
+                        '{display:none !important;} html,body{overflow:auto !important;}';
+        document.head.appendChild(s);
+    }
+    hideNow();
     var tries = 0;
     var timer = setInterval(function() {
         tries++;
-        if (run() || tries > 20) { clearInterval(timer); if (tries > 20) hide(); }
+        if (run() || tries > 40) { clearInterval(timer); if (tries > 40) hide(); }
     }, 500);
 })();
 """
@@ -286,6 +415,11 @@ class PeriodicTableXPS(wx.Frame):
         help_menu = wx.Menu()
         about_item = help_menu.Append(wx.ID_ABOUT, '&About', 'About this application')
         self.Bind(wx.EVT_MENU, self.show_about, about_item)
+        update_item = help_menu.Append(wx.ID_ANY, 'Check for &Updates...', 'Check GitHub for a newer version')
+        self.Bind(wx.EVT_MENU, lambda evt: check_for_updates(self, silent=False), update_item)
+        auto_update_item = help_menu.AppendCheckItem(wx.ID_ANY, 'Check for Updates at Startup')
+        auto_update_item.Check(self.config.get('auto_check_updates', True))
+        self.Bind(wx.EVT_MENU, self.on_toggle_auto_update, auto_update_item)
         menubar.Append(help_menu, '&Help')
 
         self.SetMenuBar(menubar)
@@ -360,7 +494,7 @@ class PeriodicTableXPS(wx.Frame):
 
     def show_about(self, event):
         """Display information about the application"""
-        about_text = """My KherveDB Library
+        about_text = f"""My KherveDB Library
 
 This application provides access to the NIST X-ray Photoelectron Spectroscopy (XPS) 
 binding energy database recorded in 2019, before it was shut down during the Trump 
@@ -377,10 +511,14 @@ This application also provide rapid access to the website XPSfitting from M. Bie
 the webite of Thermo Knowledge.
 
 Developer: Gwilherm Kerherve
-Version: 4.0"""
+Version: {APP_VERSION}"""
 
         wx.MessageBox(about_text, "About My KherveDB Library",
                       wx.OK | wx.ICON_INFORMATION)
+
+    def on_toggle_auto_update(self, event):
+        self.config['auto_check_updates'] = event.IsChecked()
+        self.save_config()
 
     def load_config(self):
         """Load configuration from config.json next to the script"""
@@ -5377,6 +5515,8 @@ def main():
         splash.Destroy()
     frame.Show()
     wx.CallAfter(show_welcome, frame)
+    if frame.config.get('auto_check_updates', True):
+        wx.CallLater(3000, check_for_updates, frame)
     app.MainLoop()
 
 
