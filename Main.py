@@ -41,6 +41,68 @@ def resource_path(*parts):
     return candidates[0]
 
 
+# Injected into every page: declines cookie banners (reject / necessary only) and hides leftovers
+_COOKIE_SCRIPT = r"""
+(function() {
+    var REJECT = /^(reject all|reject|reject all cookies|decline|decline all|refuse|refuse all|deny|only necessary|necessary only|use necessary cookies only|allow necessary cookies only|essential cookies only|only essential cookies|continue without accepting|tout refuser|refuser)$/i;
+    var IDS = ['onetrust-reject-all-handler', 'CybotCookiebotDialogBodyButtonDecline', 'truste-consent-required'];
+    var HIDE = '#onetrust-consent-sdk,#onetrust-banner-sdk,.onetrust-pc-dark-filter,#CybotCookiebotDialog,' +
+               '.cc-window,.cookie-banner,#cookie-banner,.cookie-notice,#cookie-notice,.cmp-container,#truste-consent-track';
+    function run() {
+        try {
+            for (var i = 0; i < IDS.length; i++) {
+                var b = document.getElementById(IDS[i]);
+                if (b && b.offsetParent !== null) { b.click(); return true; }
+            }
+            var els = document.querySelectorAll('button, [role=button], input[type=button], input[type=submit], a');
+            for (var j = 0; j < els.length; j++) {
+                var t = (els[j].innerText || els[j].value || '').trim().replace(/\s+/g, ' ');
+                if (t.length < 50 && REJECT.test(t) && els[j].offsetParent !== null) { els[j].click(); return true; }
+            }
+        } catch (e) {}
+        return false;
+    }
+    function hide() {
+        try {
+            if (document.getElementById('kdb-cookie-css') || !document.head) return;
+            var s = document.createElement('style');
+            s.id = 'kdb-cookie-css';
+            s.textContent = HIDE + '{display:none !important;} body{overflow:auto !important;}';
+            document.head.appendChild(s);
+        } catch (e) {}
+    }
+    var tries = 0;
+    var timer = setInterval(function() {
+        tries++;
+        if (run() || tries > 20) { clearInterval(timer); if (tries > 20) hide(); }
+    }, 500);
+})();
+"""
+
+
+def create_web_view(parent):
+    """Create a WebView using Edge (WebView2) when available, instead of the legacy IE engine.
+
+    Edge renders modern sites properly and keeps cookies between sessions, so declined
+    cookie banners stay declined. A small script auto-declines cookie banners on each page.
+    """
+    web_view = None
+    if wx.html2.WebView.IsBackendAvailable(wx.html2.WebViewBackendEdge):
+        try:
+            web_view = wx.html2.WebView.New(parent, backend=wx.html2.WebViewBackendEdge)
+        except Exception:
+            web_view = None
+    if web_view is None:
+        web_view = wx.html2.WebView.New(parent)
+    try:
+        web_view.AddUserScript(_COOKIE_SCRIPT)
+    except Exception:
+        # Backend without user scripts: run it after each load instead
+        web_view.Bind(wx.html2.EVT_WEBVIEW_LOADED,
+                      lambda evt: (web_view.RunScript(_COOKIE_SCRIPT), evt.Skip()))
+    return web_view
+
+
 # Standalone icon helper (replaces libraries.Utilities.set_app_icon)
 _ICON_PATH = resource_path("Icons", "Icon.ico")
 
@@ -1842,7 +1904,7 @@ class ElementPropertiesDialog(wx.Frame):
             toolbar_panel.SetSizer(toolbar_sizer)
 
             # Create web view control
-            self.web_view = wx.html2.WebView.New(panel)
+            self.web_view = create_web_view(panel)
 
             # Get the Thermo Fisher URL for this element
             self.thermo_url = self.get_thermo_url(self.element)
@@ -1918,7 +1980,7 @@ class ElementPropertiesDialog(wx.Frame):
             toolbar_panel.SetSizer(toolbar_sizer)
 
             # Create web view control
-            self.harwell_web_view = wx.html2.WebView.New(panel)
+            self.harwell_web_view = create_web_view(panel)
 
             # Get the Harwell XPS URL for this element
             self.harwell_url = self.get_harwell_url(self.element)
@@ -2129,7 +2191,7 @@ class ElementPropertiesDialog(wx.Frame):
             toolbar_sizer.Add(refresh_btn, 0, wx.ALL, 2)
             toolbar_panel.SetSizer(toolbar_sizer)
             # Create web view control
-            self.xps_web_view = wx.html2.WebView.New(panel)
+            self.xps_web_view = create_web_view(panel)
 
             # Get the XPS Fitting URL for this element
             self.xps_url = self.get_xps_fitting_url(self.element)
@@ -4288,7 +4350,7 @@ class ElementPropertiesDialog(wx.Frame):
             nav_panel.SetSizer(nav_sizer)
 
             # Create web view control
-            self.sss_web_view = wx.html2.WebView.New(panel)
+            self.sss_web_view = create_web_view(panel)
 
             # Set home URL (Google Scholar search page)
             self.sss_home_url = "https://scholar.google.com/"
@@ -4585,7 +4647,7 @@ class ElementPropertiesDialog(wx.Frame):
             nav_panel.SetSizer(nav_sizer)
 
             # Create web view control
-            self.estr_web_view = wx.html2.WebView.New(panel)
+            self.estr_web_view = create_web_view(panel)
 
             # Set home URL (Google Scholar search page)
             self.estr_home_url = "https://scholar.google.com/"
@@ -4886,7 +4948,7 @@ class ElementPropertiesDialog(wx.Frame):
                 toolbar_panel.SetSizer(toolbar_sizer)
 
                 # Create web view control
-                web_view = wx.html2.WebView.New(sub_panel)
+                web_view = create_web_view(sub_panel)
                 setattr(self, pdf_info['attr'], web_view)
 
                 # Load the webpage
