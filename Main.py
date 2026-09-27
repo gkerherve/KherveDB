@@ -759,8 +759,115 @@ Version: {APP_VERSION}"""
         # Set callbacks
         tile.set_click_callback(self.select_element)
         tile.set_double_click_callback(self.on_element_double_click)
+        tile.SetToolTip(self.build_element_tooltip(element))
 
         return tile
+
+    _SPIN_ORBIT_PAIRS = [("2p3/2", "2p1/2"), ("3p3/2", "3p1/2"), ("4p3/2", "4p1/2"), ("5p3/2", "5p1/2"),
+                         ("3d5/2", "3d3/2"), ("4d5/2", "4d3/2"), ("5d5/2", "5d3/2"), ("4f7/2", "4f5/2")]
+
+    # Well-established XPS interferences (Al Ka) not visible from NIST photoelectron data alone
+    _KNOWN_OVERLAPS = {
+        "C": "Ru 3d, K 2p",
+        "O": "Sb 3d5/2, Pd 3p3/2, V 2p1/2 region, Na KLL Auger",
+        "N": "Mo 3p3/2, Ta 4p3/2, Ga LMM Auger",
+        "S": "Se 3p, Si 2s",
+        "Se": "S 2p",
+        "Si": "La 4d",
+        "Al": "Pt 4f, Cu 3p, Ni 3p",
+        "Pt": "Al 2p",
+        "Ti": "Ru 3p3/2",
+        "Ru": "C 1s, Ti 2p",
+        "K": "C 1s",
+        "Mo": "N 1s (Mo 3p3/2)",
+        "Sb": "O 1s",
+        "Ni": "La 3d3/2, F KLL Auger",
+        "La": "Ni 2p3/2",
+        "Co": "Ba 3d",
+        "Ba": "Co 2p",
+        "Fe": "Sn 3p3/2, Ni LMM Auger",
+        "Au": "Zn 3p",
+        "Zn": "Au 4f (Zn 3p)",
+    }
+
+    def _line_stats(self):
+        """Median / spread / count of NIST binding energies per element and line (no satellites)."""
+        if getattr(self, "_line_stats_cache", None) is None:
+            df = self.df[~self.df['Line'].str.contains('sat', na=False)]
+            g = df.groupby(['Element', 'Line'])['BE (eV)']
+            # 5-95 % range, so a single mislabelled entry does not stretch it
+            q = g.quantile([0.05, 0.95]).unstack()
+            stats = g.agg(['median', 'count'])
+            stats['min'], stats['max'] = q[0.05], q[0.95]
+            self._line_stats_cache = stats.reset_index()
+        return self._line_stats_cache
+
+    def _element_info(self, element):
+        """Name, category and electron configuration from the properties table."""
+        if getattr(self, "_props_cache", None) is None:
+            self._props_cache = {}
+        if element not in self._props_cache:
+            stub = type("Stub", (), {"get_xps_fitting_url": lambda s, e: "", "get_thermo_url": lambda s, e: ""})()
+            try:
+                self._props_cache[element] = ElementPropertiesDialog.get_element_properties(stub, element)
+            except Exception:
+                self._props_cache[element] = {}
+        return self._props_cache[element]
+
+    def build_element_tooltip(self, element):
+        """Hover text for a periodic-table tile: electronic structure, XPS peaks and overlaps."""
+        props = self._element_info(element)
+        name = props.get("Name", element) if props.get("Name") not in (None, "Unknown") else element
+        z = self.get_atomic_number(element)
+        lines = [f"{name} ({element}), Z = {z}"]
+        if props.get("Category"):
+            lines[0] += f"  -  {props['Category']}"
+        if props.get("Electron Configuration"):
+            lines.append(f"Electron configuration: {props['Electron Configuration']}")
+        if props.get("Ground State"):
+            lines.append(f"Ground state: {props['Ground State']}")
+
+        stats = self._line_stats()
+        el_stats = stats[stats['Element'] == element].sort_values('count', ascending=False)
+        if el_stats.empty:
+            lines.append("\nNo XPS data in the NIST database for this element.")
+            return "\n".join(lines)
+
+        main_line = self.get_main_core_level(element)
+        if main_line not in set(el_stats['Line']):
+            main_line = el_stats.iloc[0]['Line']
+        lines.append(f"\nMain XPS line: {element} {main_line}")
+
+        lines.append("XPS peak positions (NIST median, 5-95% range, no. of entries):")
+        for _, r in el_stats.head(6).sort_values('median', ascending=False).iterrows():
+            rng = f"{r['min']:.1f}-{r['max']:.1f}" if r['count'] > 1 else "single entry"
+            lines.append(f"   {r['Line']:<7} {r['median']:7.1f} eV   ({rng}, n={int(r['count'])})")
+
+        med = dict(zip(el_stats['Line'], el_stats['median']))
+        cnt = dict(zip(el_stats['Line'], el_stats['count']))
+        so = [f"{hi[:2]} {med[lo] - med[hi]:.1f} eV" for hi, lo in self._SPIN_ORBIT_PAIRS
+              if hi in med and lo in med and cnt[hi] >= 2 and cnt[lo] >= 2]
+        if so:
+            lines.append("Spin-orbit splitting: " + ", ".join(so))
+
+        if element in self._KNOWN_OVERLAPS:
+            lines.append(f"Common overlaps: {self._KNOWN_OVERLAPS[element]}")
+
+        # Other elements whose lines fall within ±5 eV of the main line
+        be = med[main_line]
+        others = stats[(stats['Element'] != element) & (stats['count'] >= 2)
+                       & ((stats['median'] - be).abs() <= 5)].copy()
+        if not others.empty:
+            others['d'] = (others['median'] - be).abs()
+            others = others.sort_values('d').drop_duplicates('Element').head(6)
+            lines.append(f"NIST lines of other elements within ±5 eV of {main_line}:")
+            lines.append("   " + ", ".join(f"{r['Element']} {r['Line']} ({r['median']:.1f})"
+                                           for _, r in others.iterrows()))
+        else:
+            lines.append(f"No NIST lines of other elements within ±5 eV of {main_line}.")
+
+        lines.append("\nClick: show NIST entries  -  Double-click: Other Databases & Properties")
+        return "\n".join(lines)
 
     def get_element_positions(self) -> Dict[str, Tuple[int, int]]:
         """Define positions for elements in the periodic table grid"""
@@ -955,17 +1062,43 @@ Version: {APP_VERSION}"""
         right_sizer.Add(self.name_search, pos=(1, 1), flag=wx.EXPAND)
 
         # Buttons
-        self.properties_btn = wx.Button(search_panel, label="Other Databases && Properties")
-        self.properties_btn.Bind(wx.EVT_BUTTON, self.show_element_properties)
-        right_sizer.Add(self.properties_btn, pos=(0, 2))
-
         self.plot_btn = wx.Button(search_panel, label="Plot Results")
         self.plot_btn.Bind(wx.EVT_BUTTON, self.plot_results)
-        right_sizer.Add(self.plot_btn, pos=(1, 2))
+        right_sizer.Add(self.plot_btn, pos=(0, 2), span=(2, 1), flag=wx.EXPAND)
+
+        # Prominent button on the far right, spanning both rows
+        self.properties_btn = wx.Button(search_panel, label="Other Databases\n&& Properties  ►")
+        self.properties_btn.SetBackgroundColour(wx.Colour(30, 90, 170))
+        self.properties_btn.SetForegroundColour(wx.WHITE)
+        btn_font = self.properties_btn.GetFont()
+        btn_font.SetWeight(wx.FONTWEIGHT_BOLD)
+        btn_font.SetPointSize(btn_font.GetPointSize() + 1)
+        self.properties_btn.SetFont(btn_font)
+        self.properties_btn.Bind(wx.EVT_BUTTON, self.show_element_properties)
+
+        # Hover help, in the style of KherveFitting
+        self.element_label.SetToolTip("Element currently shown in the results table.\n"
+                                      "Click a tile in the periodic table to change it.")
+        self.line_combo.SetToolTip("Restrict the results to one core level (e.g. 2p3/2).\n"
+                                   "'All Lines' shows every line recorded for the element.")
+        self.formula_search.SetToolTip("Filter the results by chemical formula, e.g. Fe2O3 or TiO2.\n"
+                                       "Matches any part of the formula; combine with Search Name.")
+        self.name_search.SetToolTip("Filter the results by compound name, e.g. oxide, carbide, polymer.\n"
+                                    "Matches any part of the name.")
+        self.plot_btn.SetToolTip("Plot the binding energies of the results currently in the table,\n"
+                                 "to see how the chemical states spread across the energy range.")
+        self.properties_btn.SetToolTip(
+            "Open the reference window for the selected element:\n"
+            "  • XPS Fitting (Biesinger), Harwell XPS Guru, Thermo Knowledge\n"
+            "  • Surface Science Spectra and electronic-structure papers on Google Scholar\n"
+            "  • General physical and atomic properties\n"
+            "The window follows the element you click in the periodic table.\n"
+            "Tip: double-clicking an element also opens it.")
 
         # Add to main sizer
         search_sizer.Add(left_sizer, 0, wx.ALL, 10)
         search_sizer.Add(right_sizer, 1, wx.ALL | wx.EXPAND, 10)
+        search_sizer.Add(self.properties_btn, 0, wx.TOP | wx.BOTTOM | wx.RIGHT | wx.EXPAND, 10)
 
         search_panel.SetSizer(search_sizer)
         self.main_sizer.Add(search_panel, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 0)
@@ -1688,6 +1821,7 @@ class ElementPropertiesDialog(wx.Frame):
         # self.create_useful_pdf_tab(self.notebook)
         self.create_properties_tab(self.notebook)
         # self.create_xps_tab(self.notebook)
+        self.add_tab_help()
 
         # Bind notebook page change event to track selections
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
@@ -1711,6 +1845,86 @@ class ElementPropertiesDialog(wx.Frame):
         except:
             pass
         event.Skip()  # Allow the event to continue processing
+
+    # Hint bar shown at the top of each tab, keyed by tab title
+    TAB_HELP = {
+        "XPS Fitting": "XPSfitting.com (M. Biesinger): practical notes, reference spectra and fitting parameters "
+                       "for the selected element. Click another element in the main window to follow it here.",
+        "Harwell XPS Guru": "Harwell XPS knowledge base: peak positions, fitting advice and pitfalls for the "
+                            "selected element. Follows the element selected in the main window.",
+        "Thermo Knowledge": "Thermo Fisher XPS periodic table: main peaks, overlaps, spin-orbit splitting and "
+                            "chemical-state tables for the selected element.",
+        "SSS from Scholar": "Finds reference spectra published in Surface Science Spectra. Type a material or "
+                            "compound in the Search bar below (e.g. Fe2O3, NiO thin film) and press Enter: the "
+                            "search is automatically refined to Surface Science Spectra + XPS + your material.",
+        "Good paper Scholar": "Finds papers on the electronic structure of a material. Type a material in the "
+                              "Search bar below and press Enter: 'electronic structure' is added to your terms. "
+                              "Tick High Citations for the most-cited papers, untick it for the newest.",
+        "General Properties": "Physical and atomic properties of the selected element (electron configuration, "
+                              "ionisation energy, electronegativity...) and its main XPS lines.",
+    }
+
+    # Tooltips for the browser toolbars, keyed by button label
+    BUTTON_HELP = {
+        "◄ Back": "Go back to the previous page",
+        "Forward ►": "Go forward to the next page",
+        "Home": "Return to the start page for the selected element",
+        "Refresh": "Reload the current page",
+        "-": "Zoom out",
+        "+": "Zoom in",
+    }
+
+    SEARCH_HELP = {
+        "SSS from Scholar": "Type a material (e.g. Fe2O3) and press Enter or Search.\n"
+                            "The query sent to Google Scholar is:\n"
+                            "source:\"Surface Science Spectra\" XPS <your material>",
+        "Good paper Scholar": "Type a material (e.g. TiO2 anatase) and press Enter or Search.\n"
+                              "The query sent to Google Scholar is:\n"
+                              "electronic structure <your material>",
+    }
+
+    def add_tab_help(self):
+        """Add a hint bar to the top of each tab and hover help on its controls."""
+        for i in range(self.notebook.GetPageCount()):
+            title = self.notebook.GetPageText(i)
+            page = self.notebook.GetPage(i)
+            text = self.TAB_HELP.get(title)
+            if text and page.GetSizer():
+                hint_panel = wx.Panel(page)
+                hint_panel.SetBackgroundColour(wx.Colour(255, 248, 220))
+                hint = wx.StaticText(hint_panel, label="ⓘ  " + text)
+                hint.SetForegroundColour(wx.Colour(80, 60, 0))
+                hint_sizer = wx.BoxSizer(wx.VERTICAL)
+                hint_sizer.Add(hint, 0, wx.ALL | wx.EXPAND, 6)
+                hint_panel.SetSizer(hint_sizer)
+                # Rewrap to the page width whenever it changes, and shrink the bar to fit the text
+                def rewrap(evt, pg=page, hp=hint_panel, h=hint, t="ⓘ  " + text):
+                    evt.Skip()
+                    width = pg.GetClientSize().width - 16
+                    if width > 100 and getattr(hp, "_wrapped_at", None) != width:
+                        hp._wrapped_at = width
+                        h.SetLabel(t)
+                        h.Wrap(width)
+                        hp.SetMinSize((-1, h.GetBestSize().height + 12))
+                        wx.CallAfter(pg.Layout)
+                page.Bind(wx.EVT_SIZE, rewrap)
+                page.GetSizer().Insert(0, hint_panel, 0, wx.EXPAND)
+            self._add_control_help(page, title)
+            page.Layout()
+
+    def _add_control_help(self, window, tab_title):
+        for child in window.GetChildren():
+            if isinstance(child, wx.Button) and child.GetLabel() in self.BUTTON_HELP:
+                child.SetToolTip(self.BUTTON_HELP[child.GetLabel()])
+            elif isinstance(child, wx.Button) and child.GetLabel() == "Search":
+                child.SetToolTip(self.SEARCH_HELP.get(tab_title, "Run the search"))
+            elif isinstance(child, wx.TextCtrl) and tab_title in self.SEARCH_HELP:
+                child.SetToolTip(self.SEARCH_HELP[tab_title])
+                child.SetHint("Type a material, e.g. Fe2O3, then press Enter")
+            elif isinstance(child, wx.CheckBox) and child.GetLabel() == "High Citations":
+                child.SetToolTip("Ticked: most relevant / most-cited papers first.\n"
+                                 "Unticked: newest papers first.")
+            self._add_control_help(child, tab_title)
 
     def update_element(self, new_element):
         """Update the dialog to show a different element without recreating tabs"""
@@ -5518,6 +5732,7 @@ def show_welcome(frame):
 
 def main():
     app = wx.App()
+    wx.ToolTip.SetAutoPop(30000)  # keep long hover help readable
     splash = None
     splash_path = resource_path("Icons", "Splash.png")
     if os.path.exists(splash_path):
