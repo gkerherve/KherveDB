@@ -1,9 +1,9 @@
 ; KherveDB Installer - Version Configuration
 ; ==== CHANGE THESE VALUES WHEN VERSION UPDATES ====
-!define VERSION_NUMBER "4.0"
-!define ZIP_FILENAME "KherveDB_4.0.zip"
-!define FOLDER_IN_ZIP "KherveDB_4.0"
-!define EXE_FILENAME "KherveDB_4.0.exe"
+!define VERSION_NUMBER "4.1"
+!define ZIP_FILENAME "KherveDB_4.1.zip"
+!define FOLDER_IN_ZIP "KherveDB_4.1"
+!define EXE_FILENAME "KherveDB_4.1.exe"
 ; ===================================================
 
 ; Application Configuration

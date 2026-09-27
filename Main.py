@@ -41,7 +41,7 @@ def resource_path(*parts):
     return candidates[0]
 
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 GITHUB_REPO = "gkerherve/KherveDB"
 
 

@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# KherveDB one-folder (onedir) build spec - produces dist/KherveDB_4.0/
+# KherveDB one-folder (onedir) build spec - produces dist/KherveDB_4.1/
 # Packaging convention matches KherveFitting (folder + zip + NSIS installer).
 
 import os
@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-APP_NAME = "KherveDB_4.0"
+APP_NAME = "KherveDB_4.1"
 
 # Collect wx components
 wxwidgets = collect_all('wx')
