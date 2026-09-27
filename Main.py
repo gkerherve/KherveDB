@@ -297,6 +297,7 @@ class PeriodicTableXPS(wx.Frame):
 
         # Set sizer
         self.panel.SetSizer(self.main_sizer)
+        self.fit_width_to_content(window_size)
 
         # Initialize variables
         self.selected_element = None
@@ -515,6 +516,20 @@ Version: {APP_VERSION}"""
 
         wx.MessageBox(about_text, "About My KherveDB Library",
                       wx.OK | wx.ICON_INFORMATION)
+
+    def fit_width_to_content(self, window_size):
+        """Widen the (fixed-width) window if the periodic table needs more room,
+        e.g. with Windows display scaling above 100%."""
+        self.panel.Layout()
+        width = max(window_size[0], self.ClientToWindowSize(self.panel.GetBestSize()).width)
+        min_w, min_h = self.GetMinSize()
+        max_w, max_h = self.GetMaxSize()
+        self.SetMaxSize((max(max_w, width), max_h))
+        self.SetMinSize((max(min_w, width), min_h))
+        # Keep the window on screen
+        idx = wx.Display.GetFromWindow(self)
+        area = wx.Display(idx if idx >= 0 else 0).GetClientArea()
+        self.SetSize((min(width, area.width), min(max(self.GetSize().height, window_size[1]), area.height)))
 
     def on_toggle_auto_update(self, event):
         self.config['auto_check_updates'] = event.IsChecked()
