@@ -69,3 +69,7 @@ cd KherveDB
 2. Install dependencies:
 ```bash
 pip install -r requirements.txt
+
+## Licence
+
+GPL v3 or later. © 2026 Gwilherm Kerherve.
